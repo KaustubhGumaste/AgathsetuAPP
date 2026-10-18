@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101828">
+    <meta
+      name="description"
+      content="Download the NETRA Android prototype for accident-alert workflow demonstrations."
+    >
+    <title>Download NETRA</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #101828;
+        background: #f4f7fb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+
+      main {
+        width: min(100%, 560px);
+        padding: 36px;
+        border: 1px solid #e5eaf2;
+        border-radius: 24px;
+        background: white;
+        box-shadow: 0 18px 50px rgb(16 24 40 / 8%);
+      }
+
+      .brand {
+        color: #2563eb;
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 3px;
+      }
+
+      h1 {
+        margin: 22px 0 8px;
+        font-size: clamp(28px, 7vw, 40px);
+        letter-spacing: -1.2px;
+      }
+
+      p {
+        color: #475467;
+        line-height: 1.6;
+      }
+
+      .download {
+        display: flex;
+        min-height: 52px;
+        align-items: center;
+        justify-content: center;
+        margin-top: 26px;
+        border-radius: 12px;
+        background: #1d4ed8;
+        color: white;
+        font-weight: 800;
+        text-decoration: none;
+      }
+
+      .download:focus-visible {
+        outline: 3px solid #93c5fd;
+        outline-offset: 3px;
+      }
+
+      .note {
+        margin-top: 20px;
+        padding: 14px;
+        border: 1px solid #fedf89;
+        border-radius: 12px;
+        background: #fffaeb;
+        color: #93370d;
+        font-size: 13px;
+      }
+
+      h2 {
+        margin: 26px 0 8px;
+        font-size: 16px;
+      }
+
+      ol {
+        padding-left: 22px;
+        color: #475467;
+        line-height: 1.8;
+      }
+
+      .fine-print {
+        margin-top: 22px;
+        color: #667085;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="brand">NETRA</div>
+      <h1>Get the Android app</h1>
+      <p>
+        Download the NETRA prototype to try its role-based demo and accident-confirmation
+        workflow on an Android device.
+      </p>
+
+      <a class="download" href="/netra.apk" download>Download NETRA for Android</a>
+
+      <div class="note">
+        Prototype only: crash alerts are manually triggered. The app is not connected to
+        real vehicle sensors, emergency services, cameras, CARLA, or a backend.
+      </div>
+
+      <h2>Install the APK</h2>
+      <ol>
+        <li>Download the APK on your Android phone.</li>
+        <li>Open the downloaded file and allow installation from this source if Android asks.</li>
+        <li>Review the app name and install NETRA.</li>
+      </ol>
+
+      <p class="fine-print">
+        Only install APKs from a download page you trust. This prototype is not a substitute
+        for emergency services.
+      </p>
+    </main>
+  </body>
+</html>
