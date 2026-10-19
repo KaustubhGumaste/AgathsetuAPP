@@ -82,8 +82,14 @@ when available. Browser WebSockets cannot attach bearer headers, so authenticate
 are enabled only on native platforms. Local notifications require the app to be active; remote
 push and background delivery are not configured.
 
-An Android release build and download-site deployment are still separate release steps. Do not
-advertise an APK download until a signed Android artifact has been built, tested, and published.
+Pushing an app change to `main` triggers the Android APK workflow. After a successful build, the
+installable test APK is published as the `android-latest` GitHub prerelease and linked from
+`download-site/index.html`. The APK uses the Expo template debug signing key; it is for testing,
+not a Google Play production release. To install it, download the APK on Android, allow
+installation from that browser/source if prompted, and enter the reachable FastAPI server URL
+in the app. The Android workflow configures the shared C++ runtime for the React Native app and
+Expo modules before building. The web download page itself still needs a static-site host if you
+want a custom website URL; the GitHub Release URL is the direct APK download.
 
 ## Backend routes used
 

@@ -1,0 +1,81 @@
+name: Android APK
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - App.tsx
+      - app.json
+      - package.json
+      - package-lock.json
+      - index.ts
+      - src/**
+      - assets/**
+      - scripts/**
+      - download-site/**
+      - .github/workflows/android-apk.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Configure Android C++ runtime linking
+        run: node scripts/patch-android-cxx-runtime.mjs
+
+      - name: Generate Android project
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Install Android build components
+        run: |
+          sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
+
+      - name: Build installable APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Prepare APK download
+        run: cp android/app/build/outputs/apk/release/app-release.apk aghat-sethu-android.apk
+
+      - name: Publish latest Android APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-latest
+          name: AGHAT SETHU Android test build
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          overwrite_files: true
+          files: aghat-sethu-android.apk
+          body: |
+            Installable Android test build of AGHAT SETHU.
+
+            This APK is signed with the Expo template debug key for testing and is not a Google Play production release. On first launch, enter the reachable FastAPI server URL. CARLA, vision processing, and live streaming require their separately configured services.
