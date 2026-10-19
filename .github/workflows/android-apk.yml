@@ -12,6 +12,7 @@ on:
       - index.ts
       - src/**
       - assets/**
+      - plugins/**
       - scripts/**
       - download-site/**
       - .github/workflows/android-apk.yml

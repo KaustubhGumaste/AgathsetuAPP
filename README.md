@@ -88,8 +88,11 @@ installable test APK is published as the `android-latest` GitHub prerelease and 
 not a Google Play production release. To install it, download the APK on Android, allow
 installation from that browser/source if prompted, and enter the reachable FastAPI server URL
 in the app. The Android workflow configures the shared C++ runtime for the React Native app and
-Expo modules before building. The web download page itself still needs a static-site host if you
-want a custom website URL; the GitHub Release URL is the direct APK download.
+Expo modules before building. For USB-connected local testing, the APK permits cleartext HTTP
+only to `localhost` and `127.0.0.1`; keep `adb reverse tcp:8000 tcp:8000` active and enter
+`http://127.0.0.1:8000` in the app. Use HTTPS for any non-loopback backend. The web download
+page itself still needs a static-site host if you want a custom website URL; the GitHub Release
+URL is the direct APK download.
 
 ## Backend routes used
 
