@@ -52,7 +52,8 @@ type Tab =
   | 'Vehicle Registry & Search'
   | 'Vehicle Profile'
   | 'Multi-Junction Tracking'
-  | 'Violation Detail';
+  | 'Violation Detail'
+  | 'Officer Approvals';
 
 type LiveEvent = Record<string, unknown>;
 type PaymentMethod = 'upi' | 'card' | 'netbanking';
@@ -117,14 +118,16 @@ function labelForRole(role: Role) {
   return role === 'citizen' ? 'Citizen' : role === 'admin' ? 'Administrator' : 'Authority';
 }
 
-function routeForTab(tab: Tab, selectedId?: string) {
+function routeForTab(tab: Tab, selectedId?: string, selectedVehicle?: string, searchText = '') {
   const id = encodeURIComponent(selectedId ?? '');
+  const plate = encodeURIComponent(selectedVehicle ?? '');
   switch (tab) {
     case 'Dashboard':
       return '/api/citizen/fines';
-    case 'My Vehicles':
     case 'Profile Settings':
       return '/api/auth/me';
+    case 'My Vehicles':
+      return '/api/citizen/vehicles';
     case 'My Violations':
     case 'Pay Fines':
       return '/api/citizen/fines';
@@ -152,6 +155,16 @@ function routeForTab(tab: Tab, selectedId?: string) {
       return selectedId
         ? `/api/incidents/${id}`
         : '/api/incidents';
+    case 'Vehicle Registry & Search':
+      return `/api/authority/vehicles?q=${encodeURIComponent(searchText)}`;
+    case 'Vehicle Profile':
+      return selectedVehicle ? `/api/authority/vehicles/${plate}` : '';
+    case 'Multi-Junction Tracking':
+      return selectedVehicle ? `/api/authority/vehicles/${plate}/tracks` : '';
+    case 'Violation Detail':
+      return selectedId ? `/api/authority/fines/${id}` : '';
+    case 'Officer Approvals':
+      return '/api/admin/authority-accounts';
     default:
       return '';
   }
@@ -274,6 +287,7 @@ function AuthScreen({
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [apiError, setApiError] = useState('');
+  const [infoPage, setInfoPage] = useState<keyof typeof publicInfoPages | null>(null);
 
   const set = (name: string, value: string) => setValues((current) => ({ ...current, [name]: value }));
 
@@ -425,11 +439,45 @@ function AuthScreen({
             <Text style={styles.caption}>Authority and admin accounts require approval. Demo passwords are not embedded in the app.</Text>
           </Card>
         ) : renderFields()}
-        <Text style={styles.authFooter}>Privacy Policy  ·  Terms of Use  ·  Accessibility  ·  Help & Contact</Text>
+        <View style={styles.infoLinks}>
+          {(Object.keys(publicInfoPages) as Array<keyof typeof publicInfoPages>).map((key) => (
+            <Pressable accessibilityRole="button" key={key} onPress={() => setInfoPage(key)}>
+              <Text style={styles.infoLink}>{publicInfoPages[key].title}</Text>
+            </Pressable>
+          ))}
+        </View>
       </ScrollView>
+      <Modal onRequestClose={() => setInfoPage(null)} transparent visible={infoPage !== null}>
+        <View style={styles.modalShade}>
+          <Card style={styles.infoCard}>
+            <Text style={styles.cardTitle}>{infoPage ? publicInfoPages[infoPage].title : ''}</Text>
+            <Text style={styles.bodyText}>{infoPage ? publicInfoPages[infoPage].content : ''}</Text>
+            <Button onPress={() => setInfoPage(null)} secondary title="Close" />
+          </Card>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
+
+const publicInfoPages = {
+  privacy: {
+    title: 'Privacy Policy',
+    content: 'Account and incident information is retrieved from the configured AGHAT SETHU server. Evidence is available only through authenticated endpoints. The app stores native sign-in tokens in secure device storage; browser sign-in tokens are kept in memory and are cleared on page reload. Consult your service operator for the deployment-specific retention policy.',
+  },
+  terms: {
+    title: 'Terms of Use',
+    content: 'Use this application only with an authorized service account. Payment actions in this project use a simulated gateway and do not transfer money. Crash alerts and incident records are informational and do not replace contacting emergency services.',
+  },
+  accessibility: {
+    title: 'Accessibility',
+    content: 'Interactive controls expose button roles and visible labels. If you encounter an accessibility barrier, contact the administrator responsible for your AGHAT SETHU deployment.',
+  },
+  help: {
+    title: 'Help & Contact',
+    content: 'For sign-in, account approval, or service availability issues, contact the administrator responsible for your deployment. This build does not provide a public support email address or emergency hotline.',
+  },
+} as const;
 
 function ProtectedImage({ api, path }: { api: ApiClient; path: string }) {
   const [failed, setFailed] = useState(false);
@@ -621,7 +669,11 @@ function Portal({
 }) {
   const role = roleFromAccount(account);
   const isCitizen = role === 'citizen';
-  const tabs = isCitizen ? citizenTabs : authorityTabs;
+  const tabs: Tab[] = isCitizen
+    ? citizenTabs
+    : role === 'admin'
+      ? [...authorityTabs, 'Officer Approvals']
+      : authorityTabs;
   const [tab, setTab] = useState<Tab>(tabs[0]);
   const [data, setData] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
@@ -632,14 +684,21 @@ function Portal({
   const [profileName, setProfileName] = useState(account.name ?? '');
   const [profileMobile, setProfileMobile] = useState(account.mobile ?? '');
   const [selectedId, setSelectedId] = useState('');
+  const [selectedVehiclePlate, setSelectedVehiclePlate] = useState('');
+  const [vehicleSearch, setVehicleSearch] = useState('');
+  const [submittedVehicleSearch, setSubmittedVehicleSearch] = useState('');
   const [resolvePassword, setResolvePassword] = useState('');
   const [job, setJob] = useState<Record<string, unknown> | null>(null);
   const [liveEvent, setLiveEvent] = useState<LiveEvent | null>(null);
   const [liveError, setLiveError] = useState('');
   const [frameData, setFrameData] = useState<Record<string, string>>({});
+  const [livePlateEvents, setLivePlateEvents] = useState<unknown[]>([]);
   const lastFrameUpdate = useRef(0);
   const [tracksData, setTracksData] = useState<unknown>(null);
+  const [rfidHealth, setRfidHealth] = useState<unknown>(null);
   const [localAlert, setLocalAlert] = useState<LiveEvent | null>(null);
+  const [citizenIncidentAlert, setCitizenIncidentAlert] = useState<LiveEvent | null>(null);
+  const [citizenResponseMessage, setCitizenResponseMessage] = useState('');
   const [alarmPending, setAlarmPending] = useState(false);
   const [demoHistory, setDemoHistory] = useState<Array<{ id: string; response: string; time: string }>>([]);
   const [demoResponse, setDemoResponse] = useState('');
@@ -650,7 +709,7 @@ function Portal({
   const notificationsInitialized = useRef(false);
 
   const refresh = useCallback(async (target: Tab = tab, id = selectedId) => {
-    const path = routeForTab(target, id);
+    const path = routeForTab(target, id, selectedVehiclePlate, submittedVehicleSearch);
     if (!path) {
       setData(null);
       setError('');
@@ -667,30 +726,42 @@ function Portal({
     } finally {
       setBusy(false);
     }
-  }, [api, selectedId, tab]);
+  }, [api, selectedId, selectedVehiclePlate, submittedVehicleSearch, tab]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
   useEffect(() => {
-    if (isCitizen || !api.currentToken || !api.getBaseUrl() || Platform.OS === 'web') return undefined;
-    const socketUrl = api.url('/ws/live-cameras').replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
-    const AuthenticatedSocket = WebSocket as unknown as new (
-      url: string,
-      protocols: string[],
-      options: { headers: Record<string, string> },
-    ) => WebSocket;
-    const socket = new AuthenticatedSocket(socketUrl, [], {
-      headers: { Authorization: `Bearer ${api.currentToken}` },
-    });
+    if (!api.currentToken || !api.getBaseUrl() || Platform.OS === 'web') return undefined;
+    const socket = api.authenticatedSocket(isCitizen ? '/ws/citizen/alerts' : '/ws/live-cameras');
     socket.onmessage = (message) => {
       if (typeof message.data !== 'string') return;
       try {
         const event = asRecord(JSON.parse(message.data));
         const eventName = String(field(event, 'type', 'event', 'kind') ?? '');
+        if (isCitizen && eventName === 'crash_involvement') {
+          const notification = asRecord(field(event, 'notification'));
+          const notificationId = recordId(notification);
+          if (notificationId !== '—') seenNotificationIds.current.add(notificationId);
+          setCitizenIncidentAlert(event);
+          setCitizenResponseMessage('');
+          void sendLocalNotification('Possible crash involving your vehicle', String(field(notification, 'message') ?? 'Please confirm whether you were involved.'))
+            .catch((reason: unknown) => setGlobalError(reason instanceof Error ? reason.message : 'Could not show crash notification.'));
+          return;
+        }
+        if (isCitizen) return;
         const junction = String(field(event, 'junction_id', 'junction', 'camera_id') ?? 'unknown');
         const frame = field(event, 'image_base64', 'jpeg_base64', 'frame_base64', 'jpeg');
+        if (eventName === 'vehicle_boxes' || eventName === 'plate_detection') {
+          const detections = asList(event, ['detections', 'vehicles', 'boxes']);
+          const results = detections.length > 0
+            ? detections
+            : field(event, 'plate', 'plate_number', 'text') !== undefined
+              ? [event]
+              : [];
+          if (results.length > 0) setLivePlateEvents((current) => [...current, ...results].slice(-12));
+        }
         if (typeof frame === 'string' && Date.now() - lastFrameUpdate.current >= 250) {
           lastFrameUpdate.current = Date.now();
           setFrameData((current) => ({ ...current, [junction]: frame.replace(/^data:image\/jpeg;base64,/, '') }));
@@ -741,20 +812,38 @@ function Portal({
   }, [api, isCitizen]);
 
   useEffect(() => {
-    if (!alarmPending) return undefined;
+    if (isCitizen || tab !== 'Incident Evidence') return undefined;
+    let active = true;
+    void api.get<unknown>('/api/rfid/health')
+      .then((health) => { if (active) setRfidHealth(health); })
+      .catch((reason: unknown) => {
+        if (active) setError(reason instanceof Error ? reason.message : 'Could not load RFID service health.');
+      });
+    return () => { active = false; };
+  }, [api, isCitizen, tab]);
+
+  useEffect(() => {
+    if (!['Crash Incident Radar', 'Evidence Records', 'Pending Verification', 'Junction Overview'].includes(tab)) return undefined;
+    const timer = setInterval(() => void refresh(), 15000);
+    return () => clearInterval(timer);
+  }, [refresh, tab]);
+
+  useEffect(() => {
+    if (!alarmPending && !citizenIncidentAlert) return undefined;
     Vibration.vibrate(700);
     const timer = setInterval(() => Vibration.vibrate(700), 1400);
     return () => {
       clearInterval(timer);
       Vibration.cancel();
     };
-  }, [alarmPending]);
+  }, [alarmPending, citizenIncidentAlert]);
 
   const changeTab = (next: Tab) => {
     setTab(next);
     setError('');
     setPaymentMessage('');
-    if (next !== 'Incident Evidence' && next !== 'Crash Incident Report') setSelectedId('');
+    if (!['Incident Evidence', 'Crash Incident Report', 'Violation Detail'].includes(next)) setSelectedId('');
+    if (!['Vehicle Registry & Search', 'Vehicle Profile', 'Multi-Junction Tracking'].includes(next)) setSelectedVehiclePlate('');
   };
 
   const payFine = async (fineId: string, method: PaymentMethod) => {
@@ -853,10 +942,58 @@ function Portal({
     setSelectedId(id);
     setTab('Incident Evidence');
     setTracksData(null);
-    void refresh('Incident Evidence', id);
     void api.get<unknown>(`/api/incidents/${encodeURIComponent(id)}/tracks`)
       .then(setTracksData)
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Could not load incident tracks.'));
+  };
+
+  const chooseVehicle = (plate: string) => {
+    setSelectedVehiclePlate(plate);
+    setTab('Vehicle Profile');
+  };
+
+  const chooseFine = (id: string) => {
+    setSelectedId(id);
+    setTab('Violation Detail');
+  };
+
+  const confirmCitizenIncident = async (accidentOccurred: boolean) => {
+    const event = asRecord(citizenIncidentAlert);
+    const incidentId = textValue(field(event, 'incident_id') ?? field(asRecord(field(event, 'incident')), 'incident_id', 'id') ?? selectedId);
+    if (incidentId === '—') {
+      setCitizenResponseMessage('The alert did not contain an incident reference. Please use Notifications to review it.');
+      return;
+    }
+    setBusy(true);
+    setCitizenResponseMessage('');
+    try {
+      await api.post(`/api/citizen/incidents/${encodeURIComponent(incidentId)}/confirm`, {
+        accident_occurred: accidentOccurred,
+      });
+      setCitizenIncidentAlert(null);
+      setCitizenResponseMessage(accidentOccurred
+        ? 'Your accident confirmation was sent to traffic authorities.'
+        : 'Your false-alarm response was sent to traffic authorities.');
+      if (tab === 'Crash Incident Report') await refresh('Crash Incident Report', incidentId);
+      else await refresh('Notifications');
+    } catch (reason) {
+      setCitizenResponseMessage(reason instanceof Error ? reason.message : 'Your response could not be sent.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const approveAuthority = async (id: string) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api.post(`/api/admin/authority-accounts/${encodeURIComponent(id)}/approve`);
+      await refresh('Officer Approvals');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Officer account could not be approved.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const renderGenericList = (value: unknown, keys: string[] = []) => {
@@ -892,16 +1029,13 @@ function Portal({
       );
     }
     if (tab === 'My Vehicles') {
-      const accountVehicles = field(asRecord(data), 'vehicles');
-      const plate = field(asRecord(data), 'vehicle_registration_number', 'vehicle_plate', 'plate_number');
+      const accountVehicles = asList(data, ['vehicles']);
       return (
         <View style={styles.stack}>
-          <ScreenTitle title="My vehicles" caption="Only vehicles returned by your authenticated profile are shown." />
-          {Array.isArray(accountVehicles) && accountVehicles.length > 0
-            ? renderGenericList(accountVehicles, ['vehicles'])
-            : plate
-              ? <DataCard api={api} value={{ vehicle_registration_number: plate }} />
-              : <Empty text="The documented API contract does not include a citizen vehicle-list endpoint. No vehicle records were returned in your profile." />}
+          <ScreenTitle title="My vehicles" caption="Vehicles registered to your authenticated account." />
+          {accountVehicles.length > 0
+            ? accountVehicles.map((vehicle, index) => <DataCard api={api} key={`${recordId(asRecord(vehicle))}-${index}`} value={vehicle} />)
+            : <Empty text="No registered vehicles were returned for this account." />}
         </View>
       );
     }
@@ -957,7 +1091,18 @@ function Portal({
       return (
         <View style={styles.stack}>
           <ScreenTitle title="Crash incident report" caption="Citizen view excludes camera frames and RFID data." />
-          {selectedId ? renderGenericList(data, ['incident']) : <Empty text="Open this report from a crash notification. No citizen incident ID was selected." />}
+          {selectedId ? (
+            <>
+              {renderGenericList(data, ['incident'])}
+              <Card>
+                <Text style={styles.cardTitle}>Was your vehicle involved?</Text>
+                <Text style={styles.caption}>Your response is sent to the authority incident record.</Text>
+                <Button disabled={busy} onPress={() => void confirmCitizenIncident(true)} title="Yes, an accident occurred" />
+                <Button disabled={busy} onPress={() => void confirmCitizenIncident(false)} secondary title="No, this was a false alarm" />
+                {citizenResponseMessage ? <Text style={styles.successText}>{citizenResponseMessage}</Text> : null}
+              </Card>
+            </>
+          ) : <Empty text="Open this report from a crash notification. No citizen incident ID was selected." />}
         </View>
       );
     }
@@ -998,6 +1143,17 @@ function Portal({
             <View style={styles.metricRow}>
               <Metric label="Total unpaid" value={statuses.every((status) => status) ? displayMoney(unpaidAmount) : '—'} />
             </View>
+            {Array.isArray(vehicleRows) && vehicleRows.length > 0 ? (
+              <>
+                <Text style={[styles.cardTitle, styles.subsectionTitle]}>My registered vehicles</Text>
+                {vehicleRows.map((vehicle, index) => (
+                  <View key={`${recordId(asRecord(vehicle))}-${index}`} style={styles.dataLine}>
+                    <Text style={styles.dataValue}>{textValue(field(asRecord(vehicle), 'plate_number', 'vehicle_registration_number'))}</Text>
+                    <Text style={styles.caption}>{textValue(field(asRecord(vehicle), 'make'))} {textValue(field(asRecord(vehicle), 'model'))}</Text>
+                  </View>
+                ))}
+              </>
+            ) : null}
           </Card>
           {fines.slice(0, 5).map((fine, index) => <DataCard api={api} key={`${recordId(asRecord(fine))}-${index}`} value={fine} />)}
         </View>
@@ -1016,9 +1172,13 @@ function Portal({
           const record = asRecord(camera);
           const id = textValue(typeof camera === 'string' ? camera : field(record, 'junction_id', 'id', 'name') ?? `Camera ${index + 1}`);
           const frame = frameData[id];
+          const status = String(field(record, 'status') ?? (frame ? 'online' : 'offline')).toLowerCase();
           return (
             <Card key={id} style={styles.cameraCard}>
-              <Text style={styles.cardTitle}>{id}</Text>
+              <View style={styles.cardHeading}>
+                <Text style={[styles.cardTitle, styles.cameraTitle]}>{id}</Text>
+                <Tag tone={status === 'online' ? 'good' : 'bad'}>{status}</Tag>
+              </View>
               {frame ? (
                 <Image source={{ uri: `data:image/jpeg;base64,${frame}` }} style={styles.cameraFrame} resizeMode="contain" />
               ) : (
@@ -1029,11 +1189,33 @@ function Portal({
           );
         })}
         {liveEvent ? <DataCard api={api} value={liveEvent} /> : <Empty text="Waiting for live camera events. The mobile client connects with a bearer-authenticated WebSocket on native builds." />}
+        <Card>
+          <Text style={styles.cardTitle}>Live plate detections</Text>
+          {livePlateEvents.length === 0
+            ? <Text style={styles.caption}>No plate-detection events have been received.</Text>
+            : livePlateEvents.map((event, index) => <DataCard api={api} key={index} value={event} />)}
+        </Card>
       </View>
     );
   };
 
   const renderAuthority = () => {
+    if (tab === 'Officer Approvals') {
+      const officers = asList(data, ['items', 'accounts']);
+      return (
+        <View style={styles.stack}>
+          <ScreenTitle title="Officer account approvals" caption="Admin-only access. Approving an account activates its authority sign-in." />
+          {officers.length === 0 ? <Empty text="No officer accounts are awaiting approval." /> : officers.map((officer, index) => {
+            const id = recordId(asRecord(officer));
+            return (
+              <DataCard api={api} key={`${id}-${index}`} value={officer}>
+                <Button disabled={busy} onPress={() => void approveAuthority(id)} title="Approve authority account" />
+              </DataCard>
+            );
+          })}
+        </View>
+      );
+    }
     if (tab === 'Live Camera Feeds') return renderCameraGrid();
     if (tab === 'Routine Violations') {
       return (
@@ -1054,6 +1236,15 @@ function Portal({
       return (
         <View style={styles.stack}>
           <ScreenTitle title="Incident evidence" caption={selectedId ? `Incident ${selectedId}` : 'Select an incident from the radar or records list.'} />
+          <Card>
+            <Text style={styles.cardTitle}>RFID fusion</Text>
+            {rfidHealth
+              ? <View style={styles.cardHeading}>
+                <Tag tone={String(field(asRecord(rfidHealth), 'status')) === 'online' ? 'good' : 'bad'}>{String(field(asRecord(rfidHealth), 'status') ?? 'unknown')}</Tag>
+                <Text style={styles.caption}>Last report: {textValue(field(asRecord(rfidHealth), 'last_report_at'))}</Text>
+              </View>
+              : <Text style={styles.caption}>Checking RFID report status…</Text>}
+          </Card>
           {selectedId ? (
             <>
               {incident.map((item, index) => <DataCard api={api} key={index} value={item} />)}
@@ -1068,11 +1259,53 @@ function Portal({
         </View>
       );
     }
-    if (tab === 'Vehicle Registry & Search' || tab === 'Vehicle Profile' || tab === 'Multi-Junction Tracking' || tab === 'Violation Detail') {
+    if (tab === 'Vehicle Registry & Search') {
+      const vehicles = asList(data, ['vehicles']);
       return (
         <View style={styles.stack}>
-          <ScreenTitle title={tab} caption="Vehicle-intelligence pages are listed in the prompt as demo/static website data." />
-          <Empty text="No searchable vehicle registry or tracking API endpoint is specified in the supplied backend contract. This mobile app will not invent or display vehicle records." />
+          <ScreenTitle title={tab} caption="Search the registered vehicle and FASTag records." />
+          <Card>
+            <Input autoCapitalize="characters" label="Registration number or FASTag" onChangeText={setVehicleSearch} value={vehicleSearch} />
+            <Button disabled={busy} onPress={() => setSubmittedVehicleSearch(vehicleSearch.trim())} title="Search registry" />
+          </Card>
+          {vehicles.length === 0 ? <Empty text="No registered vehicle matches this search." /> : vehicles.map((vehicle, index) => {
+            const record = asRecord(vehicle);
+            const plate = String(field(record, 'plate_number', 'vehicle_registration_number') ?? '');
+            return <DataCard api={api} key={`${plate}-${index}`} onSelect={() => plate && chooseVehicle(plate)} value={vehicle} />;
+          })}
+        </View>
+      );
+    }
+    if (tab === 'Vehicle Profile') {
+      return (
+        <View style={styles.stack}>
+          <ScreenTitle title="Vehicle profile" caption={selectedVehiclePlate} />
+          {data ? <DataCard api={api} value={data} /> : <Empty text="Select a vehicle from registry search." />}
+          {selectedVehiclePlate ? (
+            <Button onPress={() => setTab('Multi-Junction Tracking')} title="View multi-junction tracking" />
+          ) : null}
+        </View>
+      );
+    }
+    if (tab === 'Multi-Junction Tracking') {
+      const items = asList(data, ['items', 'tracks']);
+      return (
+        <View style={styles.stack}>
+          <ScreenTitle title={tab} caption={selectedVehiclePlate || 'Select a vehicle from registry search.'} />
+          {items.length === 0 ? <Empty text="No junction sightings for this vehicle were returned." /> : items.map((item, index) => <DataCard api={api} key={index} value={item} />)}
+        </View>
+      );
+    }
+    if (tab === 'Violation Detail') {
+      return (
+        <View style={styles.stack}>
+          <ScreenTitle title="Violation detail" caption={selectedId ? `Fine ${selectedId}` : 'Select a fine from Fines & Revenue.'} />
+          {data ? (
+            <>
+              <DataCard api={api} value={data} />
+              {field(asRecord(data), 'evidence_url') ? <ProtectedImage api={api} path={String(field(asRecord(data), 'evidence_url'))} /> : null}
+            </>
+          ) : <Empty text="Select a fine from Fines & Revenue." />}
         </View>
       );
     }
@@ -1117,7 +1350,10 @@ function Portal({
           </View>
           <Input label="Year" keyboardType="default" onChangeText={setFinesYear} value={finesYear} />
           <Metric label="Records in current response" value={String(visibleFines.length)} />
-          {visibleFines.length ? visibleFines.map((fine, index) => <DataCard api={api} key={`${recordId(asRecord(fine))}-${index}`} value={fine} />) : <Empty text="No fines match this filter in the returned page." />}
+          {visibleFines.length ? visibleFines.map((fine, index) => {
+            const id = recordId(asRecord(fine));
+            return <DataCard api={api} key={`${id}-${index}`} onSelect={id === '—' ? undefined : () => chooseFine(id)} value={fine} />;
+          }) : <Empty text="No fines match this filter in the returned page." />}
         </View>
       );
     }
@@ -1125,7 +1361,41 @@ function Portal({
       return <View style={styles.stack}><ScreenTitle title={tab} caption="Values are returned by the authority API." />{renderGenericList(data, ['junctions'])}</View>;
     }
     if (tab === 'Overview') {
-      return <View style={styles.stack}><ScreenTitle title="Tactical operations centre" caption="Live summary from the authority service." />{data ? <DataCard api={api} value={data} /> : <Empty text="No summary data returned." />}</View>;
+      const summary = asRecord(data);
+      return (
+        <View style={styles.stack}>
+          <ScreenTitle title="Tactical operations centre" caption="Live summary from the authority service." />
+          {data ? (
+            <>
+              <Card>
+                <View style={styles.metricRow}>
+                  <Metric label="Crashes detected" value={textValue(field(summary, 'crashes_detected'))} />
+                  <Metric label="Unresolved crashes" value={textValue(field(summary, 'unresolved_crashes'))} />
+                </View>
+                <View style={styles.metricRow}>
+                  <Metric label="Traffic violations" value={textValue(field(summary, 'traffic_violations_detected'))} />
+                  <Metric label="Fines pending" value={textValue(field(summary, 'fines_pending'))} />
+                </View>
+              </Card>
+              {typeof field(summary, 'latest_crash_frame') === 'string'
+                ? <ProtectedImage api={api} path={String(field(summary, 'latest_crash_frame'))} />
+                : <Empty text="No crash frame is available from the live backend." />}
+              <Card>
+                <Text style={styles.cardTitle}>Violations by type</Text>
+                {Object.entries(asRecord(field(summary, 'violations_by_type'))).length === 0
+                  ? <Text style={styles.caption}>No violation totals returned.</Text>
+                  : Object.entries(asRecord(field(summary, 'violations_by_type'))).map(([kind, count]) => (
+                    <View key={kind} style={styles.dataLine}>
+                      <Text style={styles.dataLabel}>{kind.replaceAll('_', ' ')}</Text>
+                      <Text style={styles.dataValue}>{textValue(count)}</Text>
+                    </View>
+                  ))}
+              </Card>
+              {renderGenericList(field(summary, 'recent_crashes'), ['recent_crashes'])}
+            </>
+          ) : <Empty text="No summary data returned." />}
+        </View>
+      );
     }
     return <Empty text="Select an authority section." />;
   };
@@ -1184,6 +1454,18 @@ function Portal({
             <Text style={styles.bodyText}>This local test vibrates until you answer. It does not contact emergency services.</Text>
             <Button danger onPress={() => answerDemoAlert('Accident confirmed')} title="Yes, accident happened" />
             <Button onPress={() => answerDemoAlert('False alarm')} secondary title="No, false alarm — I'm safe" />
+          </Card>
+        </View>
+      </Modal>
+      <Modal onRequestClose={() => {}} transparent visible={!!citizenIncidentAlert}>
+        <View style={styles.modalShade}>
+          <Card style={styles.alertCard}>
+            <Tag tone="bad">POSSIBLE CRASH</Tag>
+            <Text style={styles.modalTitle}>Are you or your vehicle involved?</Text>
+            <Text style={styles.bodyText}>A possible collision was detected involving your registered vehicle. Please respond so authorities can verify the incident.</Text>
+            {citizenResponseMessage ? <Text style={styles.errorText}>{citizenResponseMessage}</Text> : null}
+            <Button danger disabled={busy} onPress={() => void confirmCitizenIncident(true)} title="Yes, an accident occurred" />
+            <Button disabled={busy} onPress={() => void confirmCitizenIncident(false)} secondary title="No, this is a false alarm" />
           </Card>
         </View>
       </Modal>
@@ -1286,6 +1568,9 @@ const styles = StyleSheet.create({
   heroTitle: { color: '#101828', fontSize: 30, fontWeight: '900', lineHeight: 37, marginTop: 12 },
   heroBody: { color: '#475467', fontSize: 14, lineHeight: 21, marginTop: 8 },
   authFooter: { alignSelf: 'center', color: '#667085', fontSize: 11, marginTop: 6, textAlign: 'center' },
+  infoLinks: { alignSelf: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: 12, justifyContent: 'center', maxWidth: 680 },
+  infoLink: { color: '#175CD3', fontSize: 11, fontWeight: '700', padding: 4 },
+  infoCard: { maxWidth: 520, width: '100%' },
   header: { alignItems: 'center', backgroundColor: '#101828', flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12 },
   headerTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '800', marginTop: 3 },
   tabBar: { alignItems: 'center', backgroundColor: '#FFFFFF', gap: 8, paddingHorizontal: 12, paddingVertical: 10 },
@@ -1301,6 +1586,7 @@ const styles = StyleSheet.create({
   card: { backgroundColor: '#FFFFFF', borderColor: '#E4E7EC', borderRadius: 15, borderWidth: 1, padding: 16 },
   cardHeading: { alignItems: 'center', flexDirection: 'row', gap: 8, justifyContent: 'space-between' },
   cardTitle: { color: '#101828', fontSize: 15, fontWeight: '800' },
+  subsectionTitle: { marginTop: 14 },
   bodyText: { color: '#475467', fontSize: 13, lineHeight: 20, marginTop: 8 },
   label: { color: '#344054', fontSize: 12, fontWeight: '700', marginBottom: 6 },
   input: { backgroundColor: '#FFFFFF', borderColor: '#D0D5DD', borderRadius: 10, borderWidth: 1, color: '#101828', fontSize: 14, minHeight: 44, paddingHorizontal: 12, paddingVertical: 10 },
@@ -1339,6 +1625,7 @@ const styles = StyleSheet.create({
   evidenceImage: { backgroundColor: '#F2F4F7', borderRadius: 8, height: 200, marginTop: 8, width: '100%' },
   video: { backgroundColor: '#101828', height: 220, marginTop: 8, width: '100%' },
   cameraCard: { backgroundColor: '#101828' },
+  cameraTitle: { color: '#FFFFFF' },
   cameraFrame: { backgroundColor: '#000000', height: 210, marginTop: 10, width: '100%' },
   cameraEmpty: { alignItems: 'center', backgroundColor: '#1D2939', height: 150, justifyContent: 'center', marginTop: 10 },
   cameraEmptyText: { color: '#D0D5DD', fontSize: 12 },

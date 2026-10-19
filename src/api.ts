@@ -19,6 +19,10 @@ export type VideoAsset = {
   mimeType?: string | null;
 };
 
+export type WebSocketOptions = {
+  headers: Record<string, string>;
+};
+
 const tokenKey = 'aghatsethu.jwt';
 let webToken: string | null = null;
 
@@ -180,6 +184,20 @@ export class ApiClient {
 
   get currentToken() {
     return this.token;
+  }
+
+  authenticatedSocket(path: string) {
+    this.requireBaseUrl();
+    if (!this.token) throw new ApiError('Sign in to connect to live events.');
+    const socketUrl = this.url(path).replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+    const AuthenticatedSocket = WebSocket as unknown as new (
+      url: string,
+      protocols: string[],
+      options: WebSocketOptions,
+    ) => WebSocket;
+    return new AuthenticatedSocket(socketUrl, [], {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
   }
 }
 

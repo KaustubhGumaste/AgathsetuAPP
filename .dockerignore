@@ -1,0 +1,12 @@
+.git
+.env
+node_modules
+dist
+.expo
+android
+backend/.venv
+backend/data
+backend/media
+__pycache__
+*.py[cod]
+*.db
