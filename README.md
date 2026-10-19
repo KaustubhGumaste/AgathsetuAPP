@@ -1,76 +1,79 @@
-# NETRA Mobile App
+# AGHAT SETHU Mobile
 
-Standalone Expo prototype for NETRA's accident-confirmation workflow and role-based views.
+Expo / React Native client for the citizen and authority portals described in
+`APP_PROMPT_FOR_MEMBER2.md`. It uses the documented FastAPI routes and does not generate
+dashboard statistics or example incident records locally.
 
-## What works in this prototype
+## Configure and run
 
-- Separate demo sign-ins for User, Admin, and Super Admin.
-- User can trigger a demo crash alert, receive a repeated vibration while the confirmation
-  prompt is open, and record either "Accident confirmed" or "False alarm."
-- Admin can view demo accident locations and response statuses only.
-- Super Admin can view incident details and camera-feed placeholders.
-- Demo incidents are held in app memory for the current session; signing out does not connect
-  to or update any external system.
-
-## Deliberate limitations
-
-This app does **not** connect to a real IMU, location service, vehicle-identification service,
-backend, database, CARLA, or camera stream. The crash alert is started manually from the User
-screen and does not contact emergency services. Camera placeholders are not live video.
-
-The demo credentials shown on the login screen are hard-coded for local UI testing only. They
-are not secure authentication and must not be used in production.
-
-## Run locally
+Install Node.js, then run from the project folder:
 
 ```powershell
-cd path\to\AgathsetuAPP
-npm install
+npm ci
+Copy-Item .env.example .env
+```
+
+Set `EXPO_PUBLIC_API_URL` in `.env` to the reachable FastAPI origin (for example,
+`https://api.example.com`, without a trailing `/api`). Alternatively, enter the origin on the
+app's portal-selection screen; that value lasts for the current app session. Start Expo:
+
+```powershell
 npm start
 ```
 
-Press `w` in the Expo terminal to open the web version, scan the QR code with Expo Go to use a
-phone, or press `a` with an Android emulator running.
+Use `w` for the web client or scan the QR code with Expo Go. A physical phone or emulator
+cannot use its own `localhost` to reach a backend on the development computer; use a LAN
+address or deployed HTTPS URL. An HTTPS site URL on port `5173` is typically Vite, not FastAPI:
+only use it if it actually proxies the documented `/api` routes and `/ws/live-cameras`.
 
-## Create an Android APK for download
+## Included
 
-An Android SDK and JDK are required to build the APK locally. Install Android Studio with its
-Android SDK and a compatible JDK, then open this project and run:
+- Citizen and authority registration/login, role routing from `/api/auth/me`, profile editing,
+  and server-side sign-out.
+- Native JWT persistence through Expo SecureStore. Web sessions are memory-only and end when
+  the page reloads; the app does not store bearer tokens in browser local storage.
+- Citizen fines, payment submission (`upi`, `card`, or `netbanking`), payment history,
+  notifications, profile, and incident report views.
+- Authority summary, camera status, junctions, fines/revenue, pending verification, incident
+  radar/records/detail, password-confirmed incident resolution, and routine-video upload/job
+  polling.
+- Protected evidence snapshots and citizen clips use bearer-authenticated requests.
+- On native builds, the authority live-camera WebSocket sends its bearer token in the
+  handshake. Received JPEG frames and crash alerts are shown when the server sends them.
+- The prior repeated-vibration accident-confirmation interaction remains as a clearly labelled
+  local test only. It does not claim to read an IMU, report a citizen response, or contact
+  emergency services.
 
-```powershell
-npx expo prebuild --platform android
-Set-Location .\android
-.\gradlew.bat assembleDebug
-```
+## Backend contract gaps and runtime notes
 
-The debug APK will be at
-`android\app\build\outputs\apk\debug\app-debug.apk`. Copy it to
-`download-site\netra.apk` before deploying the download page. Debug APKs are for testing;
-create a properly signed release APK before public production distribution.
+The supplied prompt is an endpoint summary, not the FastAPI source or OpenAPI schema. The
+backend was not available during implementation, so request/response field names and real
+server behavior have not been verified. The separate `Downloads\app` project is a Flask
+disaster-image classifier, not this traffic platform. Connect to the actual backend and check
+its `/docs` before production use.
 
-The APK has **not** been produced on this workstation yet. The local Android build currently
-stops while linking native C++ libraries (`std::__ndk1` undefined symbols), so do not deploy
-the download page until a successful build has created the APK.
+The supplied contract does not document citizen vehicle-list/search routes or authority
+vehicle-registry/search/tracking routes; those pages report that no endpoint is available
+instead of showing invented vehicles. It also does not document a separate Super Admin role
+or extra Super Admin endpoints. The app accepts only the backend roles `citizen`, `authority`,
+and `admin`; authority/admin share the documented authority portal, and backend authorization
+remains authoritative.
 
-## Publish the download page on Vercel
+Live H.264 WebRTC/WHEP playback is not implemented: the prompt describes signaling but does
+not specify the native WebRTC transport integration. Camera tiles display authenticated
+WebSocket JPEG frames when supplied and otherwise show an explicit no-frame state. The
+browser's WebSocket API cannot attach bearer headers, so the authenticated live-camera socket
+is enabled only on native platforms.
 
-1. After a successful build, put the APK at `download-site\netra.apk`.
-2. In Vercel, import this project and set the project root directory to `download-site`, or
-   deploy that folder with the Vercel CLI:
+Local notifications are presented for live crash events while the authority app is open.
+Background or remote push delivery is not configured because the backend contract does not
+describe device-token registration or push delivery.
 
-   ```powershell
-   npx vercel --prod .\download-site
-   ```
+The Android package has not been rebuilt or deployed. The previous local Android build stopped
+during C++ native-library linking; this app's native dependencies require a fresh validated
+development/release build before APK distribution. The static `download-site` page is not
+deployed and must not be advertised as a working APK download until a signed APK is available.
 
-3. The page's download button serves `/netra.apk`.
+## Backend routes used
 
-The download site contains only the static page and APK; it does not host or connect to a NETRA
-backend. Do not publish debug APKs as production releases.
-
-## Demo accounts
-
-| Role | Email | Password |
-|---|---|---|
-| User | `user@netra.demo` | `user123` |
-| Admin | `admin@netra.demo` | `admin123` |
-| Super Admin | `superadmin@netra.demo` | `super123` |
+`/api/auth/{login,me,logout,register/citizen,register/authority}`, `/api/citizen/{fines,payments,notifications,incidents}`, `/api/authority/{summary,fines,junctions,pending-verifications}`, `/api/routine-violations/{detect,jobs}`, `/api/incidents`, `/api/cameras/status`, and `/ws/live-cameras`.

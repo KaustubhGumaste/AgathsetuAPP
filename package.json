@@ -1,11 +1,15 @@
 {
-  "name": "mainapp",
+  "name": "aghatsethu-mobile",
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
     "expo": "~58.0.14",
+    "expo-document-picker": "~58.0.4",
+    "expo-notifications": "~58.1.5",
+    "expo-secure-store": "~58.0.2",
     "expo-status-bar": "~58.0.3",
     "expo-system-ui": "~58.0.6",
+    "expo-video": "~58.0.11",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "react-native": "0.88.0",
