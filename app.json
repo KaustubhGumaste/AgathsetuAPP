@@ -2,13 +2,20 @@
   "expo": {
     "name": "AGHAT SETHU",
     "slug": "aghatsethu-mobile",
-    "version": "1.0.0",
+    "version": "1.1.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.aghatsethu.mobile"
+      "bundleIdentifier": "com.aghatsethu.mobile",
+      "buildNumber": "1",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "audio"
+        ],
+        "NSLocationWhenInUseUsageDescription": "AGHAT SETHU shares your location with responders during a crash and shows you on the accident map."
+      }
     },
     "android": {
       "package": "com.aghatsethu.mobile",
@@ -18,7 +25,20 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "versionCode": 3,
+      "permissions": [
+        "VIBRATE",
+        "WAKE_LOCK",
+        "POST_NOTIFICATIONS",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ],
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW"
+      ],
+      "softwareKeyboardLayoutMode": "resize"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -26,7 +46,40 @@
     "plugins": [
       "expo-secure-store",
       "expo-video",
-      "./plugins/with-localhost-cleartext"
+      "./plugins/with-loopback-cleartext",
+      "expo-status-bar",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false,
+          "recordAudioAndroid": false,
+          "enableBackgroundPlayback": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#D92D20",
+          "sounds": [
+            "./assets/sounds/crash_alarm.wav"
+          ]
+        }
+      ],
+      "expo-asset",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "AGHAT SETHU shares your location with responders during a crash and shows you on the accident map."
+        }
+      ],
+      [
+        "expo-maps",
+        {
+          "requestLocationPermission": true,
+          "locationPermission": "AGHAT SETHU shows your position on the accident map."
+        }
+      ]
     ]
   }
 }

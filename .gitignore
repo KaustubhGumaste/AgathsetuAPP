@@ -33,7 +33,11 @@ yarn-error.*
 # local env files
 .env
 .env*.local
+backend/.env
 backend/.venv/
+.venv/
+.venv-1/
+modules/*/android/build/
 backend/data/
 backend/media/
 __pycache__/
@@ -46,3 +50,7 @@ __pycache__/
 # generated native folders
 /ios
 /android
+
+# Built APK served by /download
+backend/downloads/
+.vscode/

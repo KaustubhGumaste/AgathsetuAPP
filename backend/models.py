@@ -187,6 +187,20 @@ class PendingVerification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class EmailOtp(Base):
+    """A one-time signup code emailed to confirm the address. Only a keyed hash of the code is stored."""
+
+    __tablename__ = "email_otps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class RevokedToken(Base):
     __tablename__ = "revoked_tokens"
 
@@ -210,3 +224,18 @@ class LiveCamera(Base):
     junction_id: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
     last_frame_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latest_frame_path: Mapped[str | None] = mapped_column(Text)
+
+
+class IncidentLiveLocation(Base):
+    """Latest phone position of a citizen involved in an incident, shared with responders."""
+
+    __tablename__ = "incident_live_locations"
+    __table_args__ = (UniqueConstraint("incident_id", "user_id", name="uq_live_location_incident_user"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    latitude: Mapped[float] = mapped_column(Numeric(10, 7), nullable=False)
+    longitude: Mapped[float] = mapped_column(Numeric(10, 7), nullable=False)
+    accuracy_m: Mapped[float | None] = mapped_column(Numeric(8, 1))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

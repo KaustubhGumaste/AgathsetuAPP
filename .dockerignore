@@ -1,12 +1,19 @@
 .git
-.env
+# Secrets must never be baked into the image (backend/.env holds JWT and service secrets).
+**/.env
+**/.env.*
+!**/.env.example
 node_modules
 dist
 .expo
 android
+ios
+.venv
+.venv-1
 backend/.venv
 backend/data
 backend/media
-__pycache__
+**/.pytest_cache
+**/__pycache__
 *.py[cod]
 *.db

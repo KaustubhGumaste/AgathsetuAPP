@@ -21,10 +21,13 @@ from sqlalchemy import Engine, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from . import email_otp, google_auth
 from .database import Base, engine
 from .models import (
+    EmailOtp,
     Fine,
     Incident,
+    IncidentLiveLocation,
     IncidentResponse,
     IncidentTag,
     Junction,
@@ -45,7 +48,12 @@ from .schemas import (
     AuthorityRegistration,
     CrashConfirmationRequest,
     CitizenRegistration,
+    EmailOtpRequest,
+    EmailOtpVerify,
+    AddVehicleRequest,
     FinePaymentRequest,
+    GoogleSignInRequest,
+    LiveLocationUpdate,
     LoginRequest,
     ProfileUpdate,
     ResolveIncidentRequest,
@@ -68,6 +76,55 @@ MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_BYTES", str(500 * 1024 * 1024)))
 FRAME_FRESH_SECONDS = int(os.getenv("CAMERA_FRAME_FRESH_SECONDS", "15"))
 FINE_AMOUNTS = {"NO HELMET": 1000.0, "TRIPLE RIDING": 1000.0}
 JUNCTION_IDS = ("J01", "J02", "J03")
+# Map position of each instrumented junction, used as the crash location when the crash event does not
+# carry its own latitude/longitude. The defaults are placeholder points in Bengaluru for the simulated
+# junctions; set JUNCTION_COORDINATES="J01:12.9177:77.6238;J02:..." to the real positions.
+DEFAULT_JUNCTION_COORDINATES = {
+    "J01": (12.9177, 77.6238),
+    "J02": (13.0358, 77.5970),
+    "J03": (13.0075, 77.6950),
+}
+LIVE_LOCATION_STALE_SECONDS = 120
+
+
+def junction_coordinates() -> dict[str, tuple[float, float]]:
+    coordinates = dict(DEFAULT_JUNCTION_COORDINATES)
+    for entry in os.getenv("JUNCTION_COORDINATES", "").split(";"):
+        parts = [part.strip() for part in entry.split(":")]
+        if len(parts) != 3 or not parts[0]:
+            continue
+        try:
+            latitude, longitude = float(parts[1]), float(parts[2])
+        except ValueError:
+            continue
+        if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+            coordinates[parts[0]] = (latitude, longitude)
+    return coordinates
+
+
+JUNCTION_COORDINATES = junction_coordinates()
+
+
+def _coordinate(value: Any, low: float, high: float) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if low <= number <= high else None
+
+
+def incident_location(incident: Incident) -> dict[str, Any] | None:
+    """Where the crash happened: coordinates sent with the crash event, else the junction's position."""
+    payload = json_object(json.loads(incident.payload_json or "{}"))
+    for source in (payload, json_object(payload.get("location")), json_object(payload.get("gps"))):
+        latitude = _coordinate(source.get("latitude", source.get("lat")), -90, 90)
+        longitude = _coordinate(source.get("longitude", source.get("lng", source.get("lon"))), -180, 180)
+        if latitude is not None and longitude is not None:
+            return {"latitude": latitude, "longitude": longitude, "source": "crash_report", "label": f"Junction {incident.junction_id}"}
+    known = JUNCTION_COORDINATES.get(incident.junction_id)
+    if known:
+        return {"latitude": known[0], "longitude": known[1], "source": "junction", "label": f"Junction {incident.junction_id}"}
+    return None
 
 
 def parse_datetime(value: Any) -> datetime:
@@ -207,6 +264,7 @@ def public_incident(incident: Incident, *, citizen: bool = False) -> dict[str, A
         "vehicle_count": len(involved),
         "involved_vehicles": involved if not citizen else len(involved),
         "resolved_at": iso(incident.resolved_at),
+        "location": incident_location(incident),
     }
     if not citizen:
         result["evidence_available"] = bool(incident.evidence_path)
@@ -233,7 +291,10 @@ def _persist_image(data: str, identifier: str) -> str | None:
     if MEDIA_ROOT not in target.parents:
         raise ValueError("Evidence path escaped the media directory.")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(raw)
+    # Write then atomically replace, so a reader never receives a half-written JPEG.
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    temporary.write_bytes(raw)
+    os.replace(temporary, target)
     return relative.as_posix()
 
 
@@ -274,7 +335,10 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
 
     def require_roles(*roles: str):
         def dependency(user: User = Depends(current_user)) -> User:
-            if user.role not in roles:
+            allowed_roles = set(roles)
+            if "admin" in allowed_roles:
+                allowed_roles.add("super_admin")
+            if user.role not in allowed_roles:
                 raise HTTPException(status_code=403, detail="Your role is not authorized for this resource.")
             return user
         return dependency
@@ -315,8 +379,8 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
         if not email and not password:
             return
-        if not email or len(password) < 12:
-            raise RuntimeError("Set both BOOTSTRAP_ADMIN_EMAIL and a BOOTSTRAP_ADMIN_PASSWORD of at least 12 characters.")
+        if not email or len(password) < 8:
+            raise RuntimeError("Set both BOOTSTRAP_ADMIN_EMAIL and a BOOTSTRAP_ADMIN_PASSWORD of at least 8 characters.")
         if db.scalar(select(User).where(User.email == email)):
             return
         db.add(User(name="System Administrator", email=email, password_hash=hash_password(password), role="admin", status="active"))
@@ -351,6 +415,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     application.state.authority_sockets = set()
     application.state.citizen_sockets = set()
     application.state.socket_lock = asyncio.Lock()
+    application.state.websocket_tickets = {}
     application.state.camera_frames = {}
     configured_origins = os.getenv(
         "CORS_ORIGINS",
@@ -368,6 +433,45 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "aghat-sethu-api"}
 
+    # ---- App download: the signed Android APK is served from this same backend.
+    downloads_dir = Path(os.getenv("DOWNLOADS_DIR", "backend/downloads")).resolve()
+    apk_name = "aghat-sethu.apk"
+
+    @application.get("/download", include_in_schema=False)
+    async def download_page():
+        from fastapi.responses import HTMLResponse
+
+        apk = downloads_dir / apk_name
+        if apk.is_file():
+            size_mb = apk.stat().st_size / (1024 * 1024)
+            body = (
+                f'<a class="button" href="/download/{apk_name}" download>Download for Android ({size_mb:.0f} MB)</a>'
+                "<ol><li>Tap the button and open the file when it finishes.</li>"
+                "<li>If Android asks, allow installing apps from your browser.</li>"
+                "<li>Open AGHAT SETHU, sign in, and allow notifications and full-screen alarms.</li></ol>"
+            )
+        else:
+            body = "<p>The app is being prepared. Please check again shortly.</p>"
+        return HTMLResponse(
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'><title>AGHAT SETHU app</title>"
+            "<style>body{font-family:system-ui,sans-serif;max-width:520px;margin:40px auto;padding:0 16px;color:#101828}"
+            "h1{color:#175CD3;letter-spacing:2px;font-size:20px}.button{display:block;text-align:center;background:#175CD3;"
+            "color:#fff;padding:14px;border-radius:10px;text-decoration:none;font-weight:700;margin:20px 0}"
+            "li{margin:8px 0;color:#475467}</style></head><body><h1>AGHAT SETHU</h1>"
+            "<p>Crash alerts, e-challans and incident tracking for citizens and traffic authorities.</p>"
+            f"{body}</body></html>"
+        )
+
+    @application.get(f"/download/{apk_name}", include_in_schema=False)
+    async def download_apk():
+        from fastapi.responses import FileResponse
+
+        apk = downloads_dir / apk_name
+        if not apk.is_file():
+            raise HTTPException(status_code=404, detail="The app download is not available yet.")
+        return FileResponse(apk, media_type="application/vnd.android.package-archive", filename=apk_name)
+
     def insert_user(db: Session, user: User) -> None:
         db.add(user)
         try:
@@ -376,9 +480,81 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             db.rollback()
             raise HTTPException(status_code=409, detail="An account or vehicle with those details already exists.") from error
 
+    def require_verified_email(email: str, token: str | None) -> None:
+        if not email_otp.otp_required():
+            return
+        if email_otp.verified_email(token) != email:
+            raise HTTPException(status_code=403, detail="Verify your email address with the code we sent before creating the account.")
+
+    @application.get("/api/auth/email-otp/config")
+    async def email_otp_config() -> dict[str, Any]:
+        return {"required": email_otp.otp_required(), "available": email_otp.smtp_configured()}
+
+    @application.post("/api/auth/email-otp/request", status_code=202)
+    async def request_email_otp(request: EmailOtpRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+        if not email_otp.smtp_configured():
+            raise HTTPException(status_code=503, detail="Email verification is not available on this server right now.")
+        email = str(request.email).lower()
+        if db.scalar(select(User).where(User.email == email)):
+            raise HTTPException(status_code=409, detail="An account with this email already exists. Sign in instead.")
+        now = utcnow()
+        recent = db.scalars(
+            select(EmailOtp).where(EmailOtp.email == email, EmailOtp.created_at >= now - timedelta(hours=1))
+            .order_by(EmailOtp.created_at.desc())
+        ).all()
+        if recent:
+            last_sent = recent[0].created_at if recent[0].created_at.tzinfo else recent[0].created_at.replace(tzinfo=timezone.utc)
+            wait = int((last_sent + email_otp.OTP_RESEND_AFTER - now).total_seconds())
+            if wait > 0:
+                raise HTTPException(status_code=429, detail=f"A code was just sent. You can request another in {wait} seconds.")
+        if len(recent) >= email_otp.OTP_MAX_PER_HOUR:
+            raise HTTPException(status_code=429, detail="Too many codes requested for this email. Try again in an hour.")
+        code = email_otp.new_code()
+        # Only the newest code is valid: retire earlier ones.
+        for item in recent:
+            if item.consumed_at is None:
+                item.consumed_at = now
+        row = EmailOtp(email=email, code_hash=email_otp.hash_code(email, code), expires_at=now + email_otp.OTP_TTL, created_at=now)
+        db.add(row)
+        db.commit()
+        try:
+            await asyncio.to_thread(email_otp.send_code, email, code)
+        except Exception as error:
+            logger.error("Could not send verification email: %s", error.__class__.__name__)
+            db.delete(row)
+            db.commit()
+            raise HTTPException(status_code=502, detail="The verification email could not be sent. Try again shortly.") from error
+        return {"message": f"A 6-digit code was sent to {email}.", "expires_in_s": int(email_otp.OTP_TTL.total_seconds())}
+
+    @application.post("/api/auth/email-otp/verify")
+    async def verify_email_otp(request: EmailOtpVerify, db: Session = Depends(get_db)) -> dict[str, Any]:
+        email = str(request.email).lower()
+        row = db.scalar(
+            select(EmailOtp).where(EmailOtp.email == email, EmailOtp.consumed_at.is_(None))
+            .order_by(EmailOtp.created_at.desc())
+        )
+        expires_at = row.expires_at if row and row.expires_at.tzinfo else (row.expires_at.replace(tzinfo=timezone.utc) if row else None)
+        if row is None or expires_at is None or expires_at < utcnow():
+            raise HTTPException(status_code=400, detail="This code has expired. Request a new one.")
+        if row.attempts >= email_otp.OTP_MAX_ATTEMPTS:
+            row.consumed_at = utcnow()
+            db.commit()
+            raise HTTPException(status_code=429, detail="Too many wrong codes. Request a new one.")
+        if not email_otp.code_matches(email, request.code, row.code_hash):
+            row.attempts += 1
+            left = email_otp.OTP_MAX_ATTEMPTS - row.attempts
+            if left <= 0:
+                row.consumed_at = utcnow()
+            db.commit()
+            raise HTTPException(status_code=400, detail=f"That code is not correct. {left} attempt(s) left." if left > 0 else "Too many wrong codes. Request a new one.")
+        row.consumed_at = utcnow()
+        db.commit()
+        return {"verified": True, "email": email, "verification_token": email_otp.verification_token(email)}
+
     @application.post("/api/auth/register/citizen", status_code=201)
     async def register_citizen(request: CitizenRegistration, db: Session = Depends(get_db)) -> dict[str, Any]:
         email = str(request.email).lower()
+        require_verified_email(email, request.email_verification_token)
         user = User(
             name=request.name.strip(),
             email=email,
@@ -402,6 +578,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     @application.post("/api/auth/register/authority", status_code=201)
     async def register_authority(request: AuthorityRegistration, db: Session = Depends(get_db)) -> dict[str, Any]:
         email = str(request.email).lower()
+        require_verified_email(email, request.email_verification_token)
         user = User(
             name=request.name.strip(),
             email=email,
@@ -435,6 +612,81 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             "expires_in": JWT_TTL_MINUTES * 60,
             "user": public_user(user),
         }
+
+    @application.get("/api/auth/google/config")
+    async def google_config() -> dict[str, Any]:
+        return {"enabled": google_auth.google_sign_in_enabled()}
+
+    @application.post("/api/auth/google")
+    async def google_sign_in(request: GoogleSignInRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+        """Signs in with a Google ID token. A new Google user on the citizen portal gets a citizen account."""
+        try:
+            claims = await asyncio.to_thread(google_auth.verify_id_token, request.id_token)
+        except google_auth.GoogleTokenError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        email = str(claims["email"]).lower()
+        user = db.scalar(select(User).where(User.email == email))
+        created = False
+        if user is None:
+            if request.portal != "citizen":
+                raise HTTPException(
+                    status_code=404,
+                    detail="No officer account uses this Google email. Register on the authority portal first, then sign in with Google.",
+                )
+            fallback = email.split("@", 1)[0][:120]
+            name = str(claims.get("name") or fallback).strip()[:120]
+            user = User(
+                name=name if len(name) >= 2 else fallback,
+                email=email,
+                # Random password nobody knows: the account signs in with Google.
+                password_hash=hash_password(secrets.token_urlsafe(48)),
+                role="citizen",
+                status="active",
+            )
+            insert_user(db, user)
+            db.commit()
+            created = True
+        if user.status == "pending":
+            raise HTTPException(status_code=403, detail="Authority account is awaiting approval.")
+        if user.status != "active":
+            raise HTTPException(status_code=403, detail="Account is not active.")
+        access_token, _token_id, _expires_at = create_access_token(user)
+        has_vehicle = user.role != "citizen" or db.scalar(select(Vehicle.id).where(Vehicle.owner_id == user.id).limit(1)) is not None
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": JWT_TTL_MINUTES * 60,
+            "user": public_user(user),
+            "created": created,
+            "needs_vehicle": not has_vehicle,
+        }
+
+    @application.post("/api/auth/websocket-ticket")
+    async def create_websocket_ticket(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+        user: User = Depends(current_user),
+    ) -> dict[str, Any]:
+        # Tickets only authenticate the WebSocket handshake; each socket endpoint still
+        # enforces its own role (citizens cannot open /ws/live-cameras with one).
+        if user.role not in {"citizen", "authority", "admin", "super_admin"}:
+            raise HTTPException(status_code=403, detail="Your role cannot open live connections.")
+        if credentials is None:
+            raise HTTPException(status_code=401, detail="Bearer token is required.")
+        claims = decode_access_token(credentials.credentials)
+        if claims is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+        ticket = secrets.token_urlsafe(32)
+        expires_at = utcnow() + timedelta(seconds=30)
+        async with application.state.socket_lock:
+            expired_tickets = [
+                ticket_key
+                for ticket_key, (_user_id, _token_id, expiry) in application.state.websocket_tickets.items()
+                if expiry <= utcnow()
+            ]
+            for ticket_key in expired_tickets:
+                del application.state.websocket_tickets[ticket_key]
+            application.state.websocket_tickets[ticket] = (user.id, str(claims["jti"]), expires_at)
+        return {"ticket": ticket, "expires_in": 30}
 
     @application.get("/api/auth/me")
     async def get_me(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -504,6 +756,29 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
 
     def citizen_fines_query(db: Session, user: User):
         return select(Fine).join(Vehicle, Fine.vehicle_id == Vehicle.id).where(Vehicle.owner_id == user.id)
+
+    @application.post("/api/citizen/vehicles", status_code=201)
+    async def add_citizen_vehicle(
+        request: AddVehicleRequest,
+        user: User = Depends(require_roles("citizen")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        plate = plate_value(request.vehicle_registration_number)
+        if not plate:
+            raise HTTPException(status_code=422, detail="Vehicle registration number is required.")
+        existing = db.scalar(select(Vehicle).where(Vehicle.plate == plate))
+        if existing is not None:
+            if existing.owner_id == user.id:
+                return public_vehicle(existing)
+            raise HTTPException(status_code=409, detail="This vehicle is already registered. Contact the traffic authority if it is yours.")
+        vehicle = Vehicle(owner_id=user.id, plate=plate)
+        db.add(vehicle)
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="This vehicle is already registered.") from error
+        return public_vehicle(vehicle)
 
     @application.get("/api/citizen/fines")
     async def citizen_fines(
@@ -685,6 +960,114 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             }
         )
         return result
+
+    def public_live_location(row: IncidentLiveLocation, owner: User | None) -> dict[str, Any]:
+        updated = utc_aware(row.updated_at)
+        return {
+            "user_id": row.user_id,
+            "name": owner.name if owner else None,
+            "mobile": owner.mobile if owner else None,
+            "latitude": float(row.latitude),
+            "longitude": float(row.longitude),
+            "accuracy_m": float(row.accuracy_m) if row.accuracy_m is not None else None,
+            "updated_at": iso(updated),
+            "stale": (utcnow() - updated).total_seconds() > LIVE_LOCATION_STALE_SECONDS,
+        }
+
+    @application.post("/api/citizen/incidents/{incident_id}/location")
+    async def share_citizen_location(
+        incident_id: str,
+        request: LiveLocationUpdate,
+        user: User = Depends(require_roles("citizen")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """The phone of a citizen involved in a crash reports where it is, so responders can find them."""
+        incident = db.get(Incident, incident_id)
+        if incident is None:
+            raise HTTPException(status_code=404, detail="Incident not found.")
+        plates = json_list(incident.involved_plates_json)
+        owns_vehicle = db.scalar(
+            select(Vehicle.id).where(Vehicle.owner_id == user.id, Vehicle.plate.in_(plates)).limit(1)
+        ) if plates else None
+        if not owns_vehicle:
+            raise HTTPException(status_code=404, detail="Incident not found.")
+        if incident.status == "resolved":
+            raise HTTPException(status_code=409, detail="This incident is resolved; location sharing has stopped.")
+        row = db.scalar(
+            select(IncidentLiveLocation).where(
+                IncidentLiveLocation.incident_id == incident.id, IncidentLiveLocation.user_id == user.id
+            )
+        )
+        if row is None:
+            row = IncidentLiveLocation(incident_id=incident.id, user_id=user.id, latitude=0, longitude=0)
+            db.add(row)
+        row.latitude = request.latitude
+        row.longitude = request.longitude
+        row.accuracy_m = request.accuracy_m
+        row.updated_at = utcnow()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two updates raced to create the row; the other one stored a fresh position.
+            db.rollback()
+            return {"incident_id": incident.id, "shared": True}
+        location = public_live_location(row, user)
+        await broadcast({"type": "incident_location", "incident_id": incident.id, **location})
+        return {"incident_id": incident.id, "shared": True, "updated_at": location["updated_at"]}
+
+    @application.get("/api/incidents/{incident_id}/location")
+    async def incident_location_detail(
+        incident_id: str,
+        _user: User = Depends(require_roles("authority", "admin")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Crash location plus the live phone positions of the people involved, for the responder map."""
+        incident = authority_incident_or_404(incident_id, db)
+        rows = db.scalars(
+            select(IncidentLiveLocation)
+            .where(IncidentLiveLocation.incident_id == incident.id)
+            .order_by(IncidentLiveLocation.updated_at.desc())
+        ).all()
+        return {
+            "incident_id": incident.id,
+            "junction_id": incident.junction_id,
+            "status": incident.status,
+            "severity": incident.severity,
+            "occurred_at": iso(incident.occurred_at),
+            "location": incident_location(incident),
+            "live_locations": [public_live_location(row, db.get(User, row.user_id)) for row in rows],
+        }
+
+    @application.get("/api/incidents/{incident_id}/route")
+    async def incident_route(
+        incident_id: str,
+        from_lat: float = Query(ge=-90, le=90),
+        from_lng: float = Query(ge=-180, le=180),
+        _user: User = Depends(require_roles("authority", "admin")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Driving route from the officer's position to the crash (or the newest live position of the people involved)."""
+        incident = authority_incident_or_404(incident_id, db)
+        if not google_auth.routes_api_key():
+            raise HTTPException(status_code=503, detail="Driving routes are not configured on this server.")
+        live = db.scalar(
+            select(IncidentLiveLocation)
+            .where(IncidentLiveLocation.incident_id == incident.id)
+            .order_by(IncidentLiveLocation.updated_at.desc())
+            .limit(1)
+        )
+        if live is not None and (utcnow() - utc_aware(live.updated_at)).total_seconds() <= LIVE_LOCATION_STALE_SECONDS:
+            destination = (float(live.latitude), float(live.longitude))
+        else:
+            location = incident_location(incident)
+            if location is None:
+                raise HTTPException(status_code=404, detail="This incident has no known location.")
+            destination = (location["latitude"], location["longitude"])
+        try:
+            route = await asyncio.to_thread(google_auth.compute_driving_route, (from_lat, from_lng), destination)
+        except RuntimeError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return {"incident_id": incident.id, "destination": {"latitude": destination[0], "longitude": destination[1]}, **route}
 
     @application.get("/api/citizen/fines/{fine_id}/snapshot")
     async def citizen_fine_snapshot(fine_id: str, user: User = Depends(require_roles("citizen")), db: Session = Depends(get_db)):
@@ -974,6 +1357,59 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         result["evidence"] = [{"id": "latest", "url": f"/api/incidents/{incident.id}/evidence/latest"}] if incident.evidence_path else []
         return result
 
+    @application.get("/api/incidents/{incident_id}/junctions/{junction_id}")
+    async def incident_junction(
+        incident_id: str,
+        junction_id: str,
+        _user: User = Depends(require_roles("authority", "admin")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Evidence recorded at one junction for a crash (same shape the web portal uses)."""
+        incident = authority_incident_or_404(incident_id, db)
+        junction_id = junction_id.upper()
+        if junction_id not in JUNCTION_IDS:
+            raise HTTPException(status_code=404, detail="Junction not found.")
+        is_crash = incident.junction_id == junction_id
+        tags = db.scalars(select(IncidentTag).where(IncidentTag.incident_id == incident.id)).all()
+        sightings = db.scalars(
+            select(Sighting)
+            .where(Sighting.incident_id == incident.id, Sighting.junction_id == junction_id)
+            .order_by(Sighting.seen_at)
+        ).all()
+        vehicles: dict[str, dict[str, Any]] = {}
+        for sighting in sightings:
+            tag = next((item for item in tags if item.epc == sighting.epc), None)
+            plate = sighting.plate or (tag.plate if tag else None) or sighting.epc
+            entry = vehicles.setdefault(plate, {
+                "plate_norm": plate,
+                "plate_display": plate,
+                "epc": sighting.epc,
+                "fled": True,
+                "sightings": [],
+            })
+            entry["sightings"].append({"seen_at": iso(sighting.seen_at), "plate": sighting.plate})
+        if is_crash:
+            for tag in tags:
+                plate = tag.plate or tag.epc
+                vehicles.setdefault(plate, {
+                    "plate_norm": plate,
+                    "plate_display": plate,
+                    "epc": tag.epc,
+                    "fled": False,
+                    "reports": tag.report_count,
+                    "sightings": [{"seen_at": iso(tag.added_at), "plate": tag.plate}],
+                })
+        crash_frames = (
+            [{"name": "crash", "kind": "image", "url": f"/api/incidents/{incident.id}/evidence/latest"}]
+            if is_crash and incident.evidence_path else []
+        )
+        return {
+            "incident": {**public_incident(incident), "resolved": incident.status == "resolved"},
+            "junction": {"id": junction_id, "label": f"Junction {junction_id}", "is_crash": is_crash},
+            "crash_frames": crash_frames,
+            "vehicles": list(vehicles.values()),
+        }
+
     @application.get("/api/incidents/{incident_id}/tracks")
     async def incident_tracks(
         incident_id: str,
@@ -1045,10 +1481,19 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     async def streams(
         _user: User = Depends(require_roles("authority", "admin")),
     ) -> dict[str, Any]:
-        configured = bool(os.getenv("MEDIAMTX_WHEP_BASE_URL"))
+        base_url = os.getenv("MEDIAMTX_WHEP_BASE_URL", "").strip().rstrip("/")
+        configured = bool(base_url)
+        # MediaMTX serves WHEP at <base>/<path>/whep; one path per junction camera.
+        streams = [
+            {"junction_id": junction_id, "whep_url": f"{base_url}/{junction_id}/whep"}
+            for junction_id in JUNCTION_IDS
+        ] if configured else []
+        ice_servers = [{"urls": url.strip()} for url in os.getenv("WEBRTC_STUN_URLS", "").split(",") if url.strip()]
         return {
-            "items": [],
-            "ice_servers": [],
+            "enabled": configured,
+            "streams": streams,
+            "items": streams,
+            "ice_servers": ice_servers,
             "status": "configured" if configured else "unavailable",
             "message": None if configured else "MediaMTX WHEP is not configured.",
         }
@@ -1091,7 +1536,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         job = db.get(RoutineJob, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Video job not found.")
-        if job.submitted_by != user.id and user.role != "admin":
+        if job.submitted_by != user.id and user.role not in {"admin", "super_admin"}:
             raise HTTPException(status_code=404, detail="Video job not found.")
         return {
             "job_id": job.id,
@@ -1317,13 +1762,24 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         authorization = websocket.headers.get("authorization", "")
         scheme, _, token = authorization.partition(" ")
         claims = decode_access_token(token) if scheme.lower() == "bearer" else None
+        ticket = websocket.query_params.get("ticket")
+        if ticket:
+            async with application.state.socket_lock:
+                ticket_data = application.state.websocket_tickets.pop(ticket, None)
+            if ticket_data is not None:
+                ticket_user_id, ticket_token_id, expires_at = ticket_data
+                if expires_at > utcnow():
+                    claims = {"sub": ticket_user_id, "jti": ticket_token_id}
+        if claims is None and websocket.query_params.get("token"):
+            # The web portal authenticates the camera socket with its session token (served over wss).
+            claims = decode_access_token(websocket.query_params["token"])
         if claims is None:
             await websocket.close(code=1008, reason="Bearer authentication required.")
             return
         with factory() as db:
             user = db.get(User, str(claims["sub"]))
-            revoked = db.get(RevokedToken, str(claims["jti"])) is not None
-        if user is None or user.status != "active" or user.role not in {"authority", "admin"} or revoked:
+            revoked = db.get(RevokedToken, str(claims.get("jti", ""))) is not None
+        if user is None or user.status != "active" or user.role not in {"authority", "admin", "super_admin"} or revoked:
             await websocket.close(code=1008, reason="Authority access required.")
             return
         await websocket.accept()
@@ -1343,6 +1799,14 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         authorization = websocket.headers.get("authorization", "")
         scheme, _, token = authorization.partition(" ")
         claims = decode_access_token(token) if scheme.lower() == "bearer" else None
+        ticket = websocket.query_params.get("ticket")
+        if claims is None and ticket:
+            async with application.state.socket_lock:
+                ticket_data = application.state.websocket_tickets.pop(ticket, None)
+            if ticket_data is not None:
+                ticket_user_id, ticket_token_id, expires_at = ticket_data
+                if expires_at > utcnow():
+                    claims = {"sub": ticket_user_id, "jti": ticket_token_id}
         if claims is None:
             await websocket.close(code=1008, reason="Bearer authentication required.")
             return
@@ -1589,9 +2053,19 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         if event_type in {"camera_frame", "vehicle_boxes", "vehicle_state"}:
             junction_id = str(event.get("junction_id") or event.get("junction") or "")
             camera_id = str(event.get("camera_id") or f"CAM-{junction_id}")
-            frame = event.get("image_base64") or event.get("jpeg_base64") or event.get("frame_base64")
-            if event_type == "camera_frame" and isinstance(frame, str):
+            frame = (
+                event.get("image")
+                or event.get("image_base64")
+                or event.get("jpeg")
+                or event.get("jpeg_base64")
+                or event.get("frame_base64")
+            )
+            if event_type == "camera_frame":
+                if not isinstance(frame, str):
+                    raise ValueError("Camera frame event requires base64-encoded JPEG image data.")
                 relative = _persist_image(frame, f"camera-{camera_id}-{uuid4()}")
+                if relative is None:
+                    raise ValueError("Camera frame must contain a valid base64-encoded JPEG image.")
                 camera = db.get(LiveCamera, camera_id)
                 if camera is None:
                     camera = LiveCamera(id=camera_id, junction_id=junction_id)
@@ -1625,6 +2099,12 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         authorization = websocket.headers.get("authorization", "")
         scheme, _, supplied = authorization.partition(" ")
         if not expected or scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
+            if not expected:
+                logger.error("Rejected CARLA WebSocket: CARLA_SHARED_SECRET is not configured.")
+            else:
+                peer = websocket.client.host if websocket.client else "unknown"
+                logger.warning("Rejected CARLA WebSocket authentication from %s: missing or invalid Bearer credential.", peer)
+            await websocket.accept()
             await websocket.close(code=1008, reason="CARLA service authentication failed.")
             return
         await websocket.accept()

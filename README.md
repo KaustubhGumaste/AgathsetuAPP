@@ -1,99 +1,159 @@
 # AGHAT SETHU Mobile
 
-Expo / React Native client for the citizen and authority portals described in
-`APP_PROMPT_FOR_MEMBER2.md`. It uses the documented FastAPI routes and does not generate
-dashboard statistics or example incident records locally.
+Expo / React Native client (Android, iOS, web) and FastAPI backend for AGHAT SETHU:
+crash alerts with a crash-partner assistant, e-challans, vehicle registry, multi-junction
+RFID tracking and live junction cameras. The CARLA simulation, vision pipeline and RFID
+services are separate projects that send events to this backend.
 
-## Configure and run
-
-Install Node.js and Python 3.12 or newer. Start the backend in one PowerShell window:
-
-```powershell
-py -3.12 -m venv backend\.venv
-& backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
-$env:APP_ENV = "development"
-$env:JWT_SECRET_KEY = -join (1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
-$env:BOOTSTRAP_ADMIN_EMAIL = "admin@example.test"
-$env:BOOTSTRAP_ADMIN_PASSWORD = Read-Host "Choose a unique admin password (12+ characters)"
-$env:CARLA_SHARED_SECRET = -join (1..36 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
-$env:VISION_SHARED_SECRET = -join (1..36 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
-& backend\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
+```
+App.tsx              all screens (citizen, authority, admin, super admin)
+src/api.ts           API client (auth, errors, timeouts, session expiry)
+src/alarm.tsx        crash alarm: looping siren, vibration, keep-awake, full-screen popup
+src/notify.ts        Android notification channels and the sticky alarm notification
+src/settings.tsx     theme (light/dark) palettes and persisted user settings
+src/google.ts        Google sign-in (ID token for /api/auth/google)
+src/location.ts      live-location sharing during a crash, officer position
+src/IncidentMap.tsx  authority accident map (Google Maps, route, live positions)
+assets/sounds/       crash_alarm.wav (generated siren)
+backend/             FastAPI service (main.py, models.py, schemas.py, google_auth.py, tests/)
+eas.json             EAS build profiles (preview APK, production AAB)
 ```
 
-The API starts at `http://localhost:8000`; interactive API documentation is at
-`http://localhost:8000/docs`. For the mobile app, install dependencies and set
-`EXPO_PUBLIC_API_URL` in the root `.env` to the reachable API origin (without a trailing
-`/api`), or enter that origin in the app's server field, then start Expo:
+## 1. Run locally (development)
+
+### Backend
+
+```powershell
+cd MAINAPP
+py -3.12 -m venv backend\.venv
+backend\.venv\Scripts\Activate.ps1
+pip install -r backend\requirements.txt
+Copy-Item backend\.env.example backend\.env      # then set real secrets in backend\.env
+```
+
+`backend/main.py` does not read `.env` by itself; export the variables in your shell (or use
+Docker Compose, which reads `.env`). With no `DATABASE_URL`, data goes to SQLite in
+`backend/data`. Start it from the `MAINAPP` folder:
+
+```powershell
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+Admin accounts are never created in the app. Set `BOOTSTRAP_ADMIN_EMAIL` and
+`BOOTSTRAP_ADMIN_PASSWORD` (8+ characters) before the first start to create the first admin.
+Authority accounts register in the app and stay pending until an admin approves them.
+
+### App in Expo Go (testing only)
 
 ```powershell
 npm ci
-npm start
+$env:EXPO_PUBLIC_API_URL = "http://localhost:8000"
+npx expo start --localhost
 ```
 
-Use `w` for the web client or scan the QR code with Expo Go. A physical phone or emulator
-cannot use its own `localhost` to reach a backend on the development computer; use a LAN
-address or deployed HTTPS URL. An HTTPS site URL on port `5173` is typically Vite, not FastAPI:
-only use it if it actually proxies the documented `/api` routes and `/ws/live-cameras`.
+With the phone on USB: `adb reverse tcp:8081 tcp:8081` and `adb reverse tcp:8000 tcp:8000`,
+then open `exp://127.0.0.1:8081` in Expo Go (SDK 58). Expo Go is for development only. It
+is not the deployed app.
 
-## Included
+## 2. Checks
 
-- Citizen and authority registration/login, role routing from `/api/auth/me`, profile editing,
-  and server-side sign-out.
-- Native JWT persistence through Expo SecureStore. Web sessions are memory-only and end when
-  the page reloads; the app does not store bearer tokens in browser local storage.
-- Citizen fines, payment submission (`upi`, `card`, or `netbanking`), payment history,
-  notifications, profile, and incident report views.
-- Authority summary, camera status, junctions, fines/revenue, pending verification, incident
-  radar/records/detail, password-confirmed incident resolution, officer approvals, vehicle
-  registry/profile/tracking, violation detail, and routine-video upload/job polling.
-- Citizen crash-involvement WebSocket alerts open a continuous-vibration confirmation prompt.
-  Yes/no responses are submitted to the backend and are shown in the incident report.
-- Protected evidence snapshots and citizen clips use bearer-authenticated requests.
-- On native builds, the authority live-camera WebSocket sends its bearer token in the
-  handshake. Received JPEG frames and crash alerts are shown when the server sends them.
-- The prior repeated-vibration accident-confirmation interaction remains as a clearly labelled
-  local test only. It does not claim to read an IMU, report a citizen response, or contact
-  emergency services.
+```powershell
+npx tsc --noEmit                         # type check
+npx expo lint                            # lint
+npx expo-doctor                          # dependency / config check
+python -m pytest backend\tests -q        # backend tests (run from MAINAPP with the venv)
+npx expo export --platform android       # production JS bundle (what a release build bundles)
+```
 
-## Backend and integration boundaries
+## 3. Crash alarm
 
-This repository includes a FastAPI backend, SQLAlchemy data models, API tests, and Docker
-Compose configuration. It is a new implementation of the supplied contract; it is not a
-connection to a separately hosted member backend. The local development setup uses SQLite.
-For a containerized deployment, copy `backend\.env.example` to the repository-root `.env`,
-replace every placeholder with unique secrets, set `CORS_ORIGINS` to the deployed web origin,
-then run
-`docker compose up --build`. Compose runs PostgreSQL and the API; it does not deploy the
-Expo client or publish an APK.
+- Citizen: when a crash involves one of their registered vehicles, the backend pushes it over
+  `/ws/citizen/alerts` (polling every 15 s as a fallback; unanswered alerts are also raised
+  when the app is reopened). The app shows a full-screen popup that the back button cannot
+  dismiss, loops a siren (at the phone's media volume), vibrates continuously, keeps
+  the screen on and posts a sticky notification, until the person answers:
+  - **Yes, I need help** (one tap), or
+  - **I'm safe — false alarm** (must be pressed and held for about a second, so it cannot be
+    triggered by accident), or
+  - **Call 112** opens the dialer and silences only the siren; the popup stays.
+- Authority / super admin: every `crash_alert` raises the same alarm until acknowledged.
+- Limits: the alarm runs while the app process is alive (foreground or recently
+  backgrounded). Waking a closed app needs remote push notifications, which require a push
+  service (FCM) and a development or production build; this is not configured. The phone's
+  own vibration and notification settings still apply.
 
-The backend provides the citizen and authority routes used by this client, account approval,
-vehicle registration/search, fine/payment/notification records, crash incident and RFID
-tracking, protected evidence access, video-job status, and authenticated WebSocket ingestion
-and delivery. CARLA ingestion requires `CARLA_SHARED_SECRET`; the separate internal vision
-ingestion requires `VISION_SHARED_SECRET`. Bootstrap an admin only by explicitly configuring
-`BOOTSTRAP_ADMIN_EMAIL` and a unique `BOOTSTRAP_ADMIN_PASSWORD` (at least 12 characters).
-There are no built-in demo credentials.
+## 4. Google sign-in, accident map, live location, themes
 
-The app/backend do not themselves implement the CARLA simulator, phone/vehicle IMU hardware,
-YOLO/ANPR inference, an external payment gateway, a MediaMTX server, or a WebRTC/WHEP player.
-Video uploads return an explicit failed job when an analysis worker is not configured; the
-backend does not fabricate results. The live-camera client displays authenticated JPEG frames
-when available. Browser WebSockets cannot attach bearer headers, so authenticated live sockets
-are enabled only on native platforms. Local notifications require the app to be active; remote
-push and background delivery are not configured.
+**Live location.** When the crash alarm opens on a citizen's phone, the app sends the phone's GPS
+position to `POST /api/citizen/incidents/{id}/location` (every 5 s while moving, every 30 s while
+still). It keeps sending for an hour after "Yes, I need help", stops on "I'm safe", and the server
+refuses positions once the incident is resolved. Citizens can turn this off in Settings. It works
+while the app is open (the alarm keeps it on screen); it does not track in the background.
 
-Pushing an app change to `main` triggers the Android APK workflow. After a successful build, the
-installable test APK is published as the `android-latest` GitHub prerelease and linked from
-`download-site/index.html`. The APK uses the Expo template debug signing key; it is for testing,
-not a Google Play production release. To install it, download the APK on Android, allow
-installation from that browser/source if prompted, and enter the reachable FastAPI server URL
-in the app. The Android workflow configures the shared C++ runtime for the React Native app and
-Expo modules before building. For USB-connected local testing, the APK permits cleartext HTTP
-only to `localhost` and `127.0.0.1`; keep `adb reverse tcp:8000 tcp:8000` active and enter
-`http://127.0.0.1:8000` in the app. Use HTTPS for any non-loopback backend. The web download
-page itself still needs a static-site host if you want a custom website URL; the GitHub Release
-URL is the direct APK download.
+**Accident map (authority, admin, super admin).** The *Accident Map* section and the crash alarm's
+"Acknowledge and open map" button show every open crash on Google Maps. For the selected crash the
+map shows the crash point, the live phone position of the people involved, the officer's own
+position, the road route with distance and drive time, and buttons for turn-by-turn navigation and
+calling the person. The crash point comes from `latitude`/`longitude` in the crash event if sent,
+otherwise from the junction's position (`JUNCTION_COORDINATES`; the built-in J01–J03 points are
+placeholders in Bengaluru).
 
-## Backend routes used
+**Settings** (both portals): theme (phone setting / light / dark), profile, vehicles, live-location
+sharing, alarm readiness and sign-out.
 
-`/api/auth/{login,me,logout,register/citizen,register/authority}`, `/api/citizen/{vehicles,fines,payments,notifications,incidents}`, `/api/admin/authority-accounts`, `/api/authority/{summary,vehicles,fines,junctions,pending-verifications}`, `/api/routine-violations/{detect,jobs}`, `/api/incidents`, `/api/cameras/status`, `/ws/citizen/alerts`, `/ws/live-cameras`, and `/ws/carla/cameras`.
+**One-time Google Cloud setup** (console.cloud.google.com, one project):
+
+| What | Where it goes |
+| --- | --- |
+| OAuth consent screen (External) | — |
+| OAuth client, type **Web application** | `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` (app build) and `GOOGLE_CLIENT_IDS` (backend) |
+| OAuth client, type **Android**: package `com.aghatsethu.mobile` + SHA-1 of the signing key (`eas credentials`, and the Play app-signing key for Play builds) | nothing to copy; Google matches it |
+| API key with **Maps SDK for Android** enabled, restricted to the package + SHA-1 | `GOOGLE_MAPS_ANDROID_API_KEY` (app build) |
+| API key with **Routes API** enabled (server key) | `GOOGLE_ROUTES_API_KEY` (backend only) |
+
+Set the app values for EAS builds with `eas env:create` (preview and production), then rebuild. These
+are native changes: Expo Go cannot show the Google button or the native map (the map falls back to
+an embedded Google Maps page). After changing plugins locally, regenerate the native project with
+`npx expo prebuild --clean` before `npx expo run:android`. Without the keys, the app still works:
+the Google button is hidden, the map falls back to the embedded page, and routes become a
+straight line plus the turn-by-turn button.
+
+## 5. Deploy the backend (production)
+
+Requirements: a Linux host with Docker, a domain name, and HTTPS in front of the API
+(release builds of the app only allow HTTPS, apart from localhost).
+
+```bash
+cp backend/.env.example .env     # set POSTGRES_PASSWORD, JWT_SECRET_KEY, BOOTSTRAP_ADMIN_*,
+                                 # CARLA_SHARED_SECRET, VISION_SHARED_SECRET (all unique)
+docker compose up -d --build     # PostgreSQL 16 + API on port 8000
+```
+
+Put a reverse proxy (Caddy, Nginx or a platform load balancer) in front of port 8000 with a
+TLS certificate. It must forward WebSocket upgrades for `/ws/...`. Keep the API to one
+worker: live sockets and socket tickets live in process memory. `.dockerignore` keeps every
+`.env`, the local database and virtual environments out of the image.
+
+## 6. Build the Android app
+
+The API address is compiled into the build from `EXPO_PUBLIC_API_URL`; users can still
+change it on the sign-in screen.
+
+```powershell
+npm install -g eas-cli          # or: npx eas-cli@latest <command>
+eas login
+eas init                        # links the project to your Expo account (adds projectId)
+eas env:create --name EXPO_PUBLIC_API_URL --value https://api.your-domain --environment preview
+eas env:create --name EXPO_PUBLIC_API_URL --value https://api.your-domain --environment production
+eas build --platform android --profile preview      # installable APK for testers
+eas build --platform android --profile production   # AAB for Google Play
+```
+
+Increase `expo.android.versionCode` in `app.json` for every Play Store upload. Publishing to
+Google Play (`eas submit`) needs a Play Console account. The GitHub workflow in
+`.github/workflows/android-apk.yml` builds a debug-signed test APK only.
+
+## 7. Status
+
+- Live camera feed: unchanged and still being worked on separately.
+- Not deployed: the backend and the app are prepared for deployment but not deployed.

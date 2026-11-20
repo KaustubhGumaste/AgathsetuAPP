@@ -8,8 +8,9 @@ class CitizenRegistration(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     email: EmailStr
     mobile: str = Field(min_length=7, max_length=30)
-    password: str = Field(min_length=10, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
     vehicle_registration_number: str = Field(min_length=4, max_length=20)
+    email_verification_token: str | None = Field(default=None, max_length=2000)
 
     @field_validator("vehicle_registration_number")
     @classmethod
@@ -22,7 +23,17 @@ class AuthorityRegistration(BaseModel):
     email: EmailStr
     badge_number: str = Field(min_length=2, max_length=80)
     jurisdiction: str = Field(min_length=2, max_length=120)
-    password: str = Field(min_length=10, max_length=128)
+    password: str = Field(min_length=8, max_length=128)
+    email_verification_token: str | None = Field(default=None, max_length=2000)
+
+
+class EmailOtpRequest(BaseModel):
+    email: EmailStr
+
+
+class EmailOtpVerify(BaseModel):
+    email: EmailStr
+    code: str = Field(pattern=r"^\d{6}$")
 
 
 class LoginRequest(BaseModel):
@@ -41,6 +52,27 @@ class FinePaymentRequest(BaseModel):
 
 class CrashConfirmationRequest(BaseModel):
     accident_occurred: bool
+
+
+class GoogleSignInRequest(BaseModel):
+    id_token: str = Field(min_length=20, max_length=4096)
+    # Which sign-in portal the person used. Only the citizen portal creates new accounts.
+    portal: Literal["citizen", "authority", "admin"] = "citizen"
+
+
+class AddVehicleRequest(BaseModel):
+    vehicle_registration_number: str = Field(min_length=4, max_length=20)
+
+    @field_validator("vehicle_registration_number")
+    @classmethod
+    def normalize_plate(cls, value: str) -> str:
+        return "".join(value.upper().split())
+
+
+class LiveLocationUpdate(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_m: float | None = Field(default=None, ge=0, le=100000)
 
 
 class VehicleRegistryRequest(BaseModel):
