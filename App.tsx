@@ -2336,7 +2336,7 @@ function Portal({
           </>
         ) : null}
 
-        {isOfficer ? (
+        {isOfficer && !portalServer ? (
           <>
             <SectionLabel>My authority centre</SectionLabel>
             <Card>
