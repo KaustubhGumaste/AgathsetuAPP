@@ -68,6 +68,10 @@ function portalIncident(value: unknown): Rec {
     resolved_by: incident.resolved_by_name,
     resolution_note: incident.resolution_note,
     live_feed: incident.live_feed,
+    // Owners' "are you safe?" answers and the case outcome the website derives from them.
+    false_alarm: incident.false_alarm === true ? true : undefined,
+    case: incident.case ?? undefined,
+    latest_citizen_response: incident.latest_citizen_response ?? undefined,
   });
 }
 

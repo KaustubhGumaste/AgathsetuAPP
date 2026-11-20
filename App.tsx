@@ -43,7 +43,7 @@ import {
 import { requestNotificationPermission, sendLocalNotification } from './src/notify';
 import { JUNCTIONS, normalizeStreams, routesFor } from './src/adapters';
 import { LiveVideo } from './src/LiveVideo';
-import { CrashMonitor, type CrashMonitorStatus, crashMonitorAvailable } from './modules/crash-monitor';
+import { ANSWER_TIMEOUT_MS, CrashMonitor, type CrashMonitorStatus, crashMonitorAvailable } from './modules/crash-monitor';
 import { type Palette, SettingsProvider, type ThemeMode, colors, pageStatusBarStyle, themedStyles, useSettings } from './src/settings';
 import { GoogleSignInCancelled, getGoogleIdToken, googleSignInAvailable, googleSignOut } from './src/google';
 import { currentPosition, formatDistance, useCrashLocationShare } from './src/location';
@@ -126,6 +126,7 @@ const optionalTabProbes: Partial<Record<Tab, string>> = {
   'Vehicle Profile': '/api/authority/vehicles',
   'Multi-Junction Tracking': '/api/authority/vehicles',
   'Officer Approvals': '/api/admin/authority-accounts',
+  'Authority Centres': '/api/authority/centers',
   'Routine Violations': '/api/routine-violations/detect',
 };
 
@@ -1200,11 +1201,14 @@ function Portal({
   const role = roleFromAccount(account);
   const isCitizen = role === 'citizen';
   const portalServer = api.currentDialect === 'portal';
+  // The website backend has one admin role with full authority access: the app's Super Admin.
+  const fullAdmin = role === 'super_admin' || (role === 'admin' && portalServer);
+  const roleLabel = fullAdmin ? labelForRole('super_admin') : labelForRole(role);
   const allTabs: Tab[] = isCitizen
     ? citizenTabs
-    : role === 'admin'
+    : role === 'admin' && !fullAdmin
       ? ['Accident Map', 'Junction Overview', 'Crash Incident Radar', 'Incident Evidence', 'Officer Approvals', 'Authority Centres', 'Settings']
-      : role === 'super_admin'
+      : fullAdmin
         ? [...authorityTabs.filter((item) => item !== 'Settings'), 'Officer Approvals', 'Authority Centres', 'Settings']
         : authorityTabs;
   // Optional sections are probed once; until then they are hidden so nothing flashes an error.
@@ -1255,11 +1259,22 @@ function Portal({
   const [livePlateEvents, setLivePlateEvents] = useState<unknown[]>([]);
   const lastFrameUpdate = useRef(0);
   const [tracksData, setTracksData] = useState<unknown>(null);
+  // Website backend: crashes from the live CARLA pipeline (CR-… ids), which are not on the incident board.
+  const [liveCrashes, setLiveCrashes] = useState<Array<Record<string, unknown>>>([]);
   const [rfidHealth, setRfidHealth] = useState<unknown>(null);
   // Authority crash alerts waiting to be acknowledged (newest first).
   const [authorityAlerts, setAuthorityAlerts] = useState<LiveEvent[]>([]);
   // Citizen crash alarm
   const [alarmPending, setAlarmPending] = useState(false);
+  // Citizen alarm countdown: unanswered after 30 s, the crash is reported as a severe accident.
+  const [answerDeadline, setAnswerDeadline] = useState<number | null>(null);
+  const [autoReported, setAutoReported] = useState(false);
+  const [clock, setClock] = useState(() => Date.now());
+  const autoReportAttempt = useRef(0);
+  // The crash whose alarm is showing, and further crashes waiting for their own alarm (one at a
+  // time: each must be answered, none is dropped).
+  const currentAlarmId = useRef('');
+  const alarmQueue = useRef<string[]>([]);
   const [alarmMuted, setAlarmMuted] = useState(false);
   const [confirmationIncidentId, setConfirmationIncidentId] = useState('');
   const [confirmationIncident, setConfirmationIncident] = useState<Record<string, unknown> | null>(null);
@@ -1303,6 +1318,7 @@ function Portal({
   useCrashAlarm({
     active: alarmActive,
     soundMuted: alarmMuted,
+    citizenIncidentId: isCitizen && alarmPending ? confirmationIncidentId : '',
     title: isCitizen ? 'Possible crash involving your vehicle' : `Crash detected · ${textValue(field(asRecord(activeAuthorityAlert), 'junction_id', 'junction'))}`,
     body: isCitizen
       ? 'Open AGHAT SETHU and tell us whether you are safe.'
@@ -1380,7 +1396,7 @@ function Portal({
     const path = isCitizen
       ? '/api/citizen/notifications'
       : api.currentDialect === 'portal'
-        ? '/api/incidents/board?view=radar'
+        ? '/api/incidents/board?view=radar|/api/authority/live'
         : role === 'authority' ? '/api/incidents/board?scope=dispatch' : '/api/incidents/board';
     CrashMonitor.start(api.getBaseUrl(), api.currentToken, isCitizen ? 'citizen' : 'authority', path, 5000);
   }, [api, isCitizen, role]);
@@ -1395,10 +1411,18 @@ function Portal({
   }, [alarmActive]);
 
   // Authorities: opening the app from a background crash alarm silences it; the radar shows the crash.
+  // (An in-app alert that is still open keeps its own siren until acknowledged.)
+  const authorityAlertCount = useRef(0);
+  useEffect(() => { authorityAlertCount.current = authorityAlerts.length; }, [authorityAlerts.length]);
   useEffect(() => {
     if (isCitizen) return undefined;
+    const silence = () => {
+      CrashMonitor.cancelAlarm();
+      if (authorityAlertCount.current === 0) CrashMonitor.stopSiren();
+    };
+    if (AppState.currentState === 'active') silence();
     const subscription = AppState.addEventListener('change', (state) => {
-      if (state === 'active') CrashMonitor.cancelAlarm();
+      if (state === 'active') silence();
     });
     return () => subscription.remove();
   }, [isCitizen]);
@@ -1484,6 +1508,19 @@ function Portal({
               }
             }
             if (eventName === 'crash_alert') {
+              if (!field(event, 'junction_id', 'junction') && typeof field(event, 'location') === 'string') {
+                Object.assign(event, { junction_id: field(event, 'location') });
+              }
+              // Older website versions send CARLA crash alerts without an incident id: give each its own
+              // key, or every alert after the first is taken for a duplicate.
+              if (!field(event, 'incident_id', 'id')) {
+                const plates = [field(event, 'plate_number'), field(event, 'collision_partner_plate')].filter(Boolean);
+                Object.assign(event, {
+                  incident_id: String(field(event, 'alert_id') ?? `${String(field(event, 'vehicle_id') ?? 'car')}-${String(field(event, 'timestamp_sim', 'frame') ?? Date.now())}`),
+                  junction_id: field(event, 'junction_id') ?? `car ${String(field(event, 'vehicle_id') ?? '?')}${field(event, 'plate_number') ? ` (${String(field(event, 'plate_number'))})` : ''}`,
+                  involved_vehicles: field(event, 'involved_vehicles') ?? plates,
+                });
+              }
               setAuthorityAlerts((current) => {
                 const incidentId = textValue(field(event, 'incident_id', 'id'));
                 if (current.some((item) => textValue(field(item, 'incident_id', 'id')) === incidentId)) return current;
@@ -1530,12 +1567,24 @@ function Portal({
 
   const raiseCitizenAlarm = useCallback((incidentId: string, incident?: Record<string, unknown>) => {
     if (!incidentId || incidentId === '—' || answeredIncidents.current.has(incidentId)) return;
+    if (currentAlarmId.current && currentAlarmId.current !== incidentId) {
+      if (!alarmQueue.current.includes(incidentId)) alarmQueue.current.push(incidentId);
+      return;
+    }
+    currentAlarmId.current = incidentId;
     setSharingIncidentId(incidentId);
     setShareUntil(null);
     setConfirmationIncidentId(incidentId);
     setConfirmationIncident(incident ?? null);
     setConfirmationMessage('');
     setAlarmMuted(false);
+    // Starts the siren now and the shared 30 s countdown (keeps the start time if the background
+    // service raised this alarm while the app was closed).
+    const native = CrashMonitor.startAlarm(incidentId);
+    const sameAlarm = native !== null && native.incidentId === incidentId && native.startedAt > 0;
+    setAnswerDeadline((sameAlarm ? native.startedAt : Date.now()) + ANSWER_TIMEOUT_MS);
+    setAutoReported(Boolean(sameAlarm && native.reported));
+    autoReportAttempt.current = 0;
     setAlarmPending(true);
     if (!incident) {
       void api.get<unknown>(`/api/citizen/incidents/${encodeURIComponent(incidentId)}`)
@@ -1543,6 +1592,57 @@ function Portal({
         .catch(() => undefined);
     }
   }, [api]);
+
+  // An alarm the background service raised while the app was closed is still sounding: show it.
+  useEffect(() => {
+    if (!isCitizen) return;
+    const native = CrashMonitor.alarmState();
+    if (native?.incidentId) raiseCitizenAlarm(native.incidentId);
+  }, [isCitizen, raiseCitizenAlarm]);
+
+  // Nobody answered within 30 seconds: report a severe accident ("I need help") so responders are
+  // sent. The alarm keeps sounding; a later answer from the person replaces this report.
+  const reportUnanswered = useCallback(async (incidentId: string) => {
+    const native = CrashMonitor.alarmState();
+    if (native && native.incidentId === incidentId && native.reported) {
+      setAutoReported(true);
+      return;
+    }
+    const note = 'No answer within 30 seconds: reported automatically by the app as a severe accident.';
+    await api.post<unknown>(
+      `/api/citizen/incidents/${encodeURIComponent(incidentId)}/confirm`,
+      api.currentDialect === 'portal'
+        ? { accident_occurred: true, note }
+        : { outcome: 'need_help', accident_occurred: true, note },
+    );
+    CrashMonitor.markAlarmReported(incidentId);
+    setAutoReported(true);
+    setConfirmationMessage('');
+    // Keep sending the live location so responders can find the person.
+    setSharingIncidentId(incidentId);
+    setShareUntil(Date.now() + 60 * 60 * 1000);
+  }, [api]);
+
+  const countingDown = isCitizen && alarmPending && answerDeadline !== null && !autoReported;
+  useEffect(() => {
+    if (!countingDown || answerDeadline === null) return undefined;
+    const incidentId = confirmationIncidentId;
+    const tick = () => {
+      const now = Date.now();
+      setClock(now);
+      // Retry every 5 s if the server could not be reached.
+      if (now >= answerDeadline && now - autoReportAttempt.current >= 5000) {
+        autoReportAttempt.current = now;
+        void reportUnanswered(incidentId).catch(() => {
+          setConfirmationMessage('No answer in 30 seconds. Reporting a severe accident: retrying, check your connection.');
+        });
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [answerDeadline, confirmationIncidentId, countingDown, reportUnanswered]);
+  const secondsLeft = answerDeadline === null ? 0 : Math.max(0, Math.ceil((answerDeadline - clock) / 1000));
 
   // Citizen on the website backend: instant alarm over /ws/events. The token is sent in the first
   // message (never in the URL); the 5-second notification poll below stays as the fallback.
@@ -1717,9 +1817,10 @@ function Portal({
             try {
               const incident = asRecord(await api.get<unknown>(`/api/citizen/incidents/${encodeURIComponent(incidentId)}`));
               if (!active) return;
-              if (!field(incident, 'response') && String(field(incident, 'status') ?? '') !== 'resolved') {
-                raiseCitizenAlarm(incidentId, incident);
-                break;
+              const saved = asRecord(field(incident, 'response'));
+              const unanswered = !field(incident, 'response') || saved.response === 'no_answer';
+              if (unanswered && String(field(incident, 'status') ?? '') !== 'resolved') {
+                raiseCitizenAlarm(incidentId, incident); // further ones queue behind the first
               }
             } catch {
               // incident no longer visible to this citizen
@@ -1934,9 +2035,18 @@ function Portal({
         setSharingIncidentId('');
         setShareUntil(null);
       }
-      CrashMonitor.cancelAlarm();
-      setAlarmPending(false);
-      setAlarmMuted(false);
+      alarmQueue.current = alarmQueue.current.filter((id) => id !== incidentId);
+      if (currentAlarmId.current === incidentId || !currentAlarmId.current) {
+        currentAlarmId.current = '';
+        CrashMonitor.cancelAlarm();
+        setAlarmPending(false);
+        setAnswerDeadline(null);
+        setAutoReported(false);
+        setAlarmMuted(false);
+        // Next crash waiting for an answer: its own alarm and countdown, after a short pause.
+        const next = alarmQueue.current.shift();
+        if (next) setTimeout(() => raiseCitizenAlarm(next), 800);
+      }
       setConfirmationMessage(
         recorded === 'need_help'
           ? `Recorded: you need help. The traffic authorities have been alerted. Call ${EMERGENCY_NUMBER} if anyone is injured.`
@@ -2139,6 +2249,76 @@ function Portal({
     } finally {
       setBusy(false);
     }
+  };
+
+  const loadLiveCrashes = useCallback(async () => {
+    try {
+      const live = asRecord(await api.get<unknown>('/api/authority/live'));
+      setLiveCrashes(asList(live, ['crashes']).map(asRecord).slice(0, 30));
+    } catch {
+      // older website without the live dashboard: the section stays hidden
+    }
+  }, [api]);
+
+  const showLiveCrashes = !isCitizen && portalServer && tab === 'Crash Incident Radar';
+  useEffect(() => {
+    if (!showLiveCrashes) return undefined;
+    void loadLiveCrashes();
+    const timer = setInterval(() => {
+      if (AppState.currentState === 'active') void loadLiveCrashes();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [loadLiveCrashes, showLiveCrashes]);
+
+  // Website backend: the authority accepts an owner's "false alarm / minor" answer (closes the case)
+  // or keeps the case open.
+  const decideOwnerAnswer = async (responseId: string, accept: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api.post(`/api/authority/crash-responses/${encodeURIComponent(responseId)}/${accept ? 'accept' : 'reject'}`);
+      if (portalServer) await loadLiveCrashes();
+      await refresh({ silent: true });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not save the decision.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Case outcome and the newest owner answer (website backend), with the authority's decision buttons. */
+  const renderCaseOutcome = (record: Record<string, unknown>) => {
+    const outcome = asRecord(field(record, 'case'));
+    const answer = asRecord(field(record, 'latest_citizen_response'));
+    if (!outcome.outcome && !answer.response) return null;
+    const state = String(outcome.outcome ?? '');
+    const answerId = textValue(field(answer, 'id'));
+    return (
+      <View style={styles.stack}>
+        {state ? (
+          <View style={styles.cardHeading}>
+            <Text style={[styles.bodyText, styles.shrink]}>
+              Case: {typeof outcome.reason === 'string' ? outcome.reason : state.replace('_', ' ')}
+            </Text>
+            <Tag tone={state === 'resolved' ? 'good' : state === 'not_resolved' ? 'bad' : 'warning'}>
+              {state === 'resolved' ? (outcome.automatic === true ? 'auto-resolved' : 'resolved') : state === 'not_resolved' ? (outcome.severe === true ? 'severe' : 'not resolved') : 'waiting'}
+            </Tag>
+          </View>
+        ) : null}
+        {answer.response ? (
+          <Text style={answer.response === 'accident' ? styles.errorText : styles.bodyText}>
+            👤 {textValue(field(answer, 'owner_name', 'plate'))}: {textValue(field(answer, 'label', 'response'))}
+            {answer.responded_at ? ` (${displayDate(answer.responded_at)})` : ''}
+          </Text>
+        ) : null}
+        {answer.review_status === 'pending' && answerId !== '—' ? (
+          <View style={styles.inlineButtons}>
+            <Button compact disabled={busy} onPress={() => void decideOwnerAnswer(answerId, true)} title="Resolve as false alarm / minor" />
+            <Button compact disabled={busy} onPress={() => void decideOwnerAnswer(answerId, false)} secondary title="Keep open" />
+          </View>
+        ) : null}
+      </View>
+    );
   };
 
   const chooseIncident = (id: string) => {
@@ -2404,7 +2584,7 @@ function Portal({
 
         <SectionLabel>Account</SectionLabel>
         <Card>
-          <Text style={styles.cardTitle}>{labelForRole(role)} account</Text>
+          <Text style={styles.cardTitle}>{roleLabel} account</Text>
           <Text style={styles.caption}>Signed in as {textValue(account.email)}</Text>
           <Text style={styles.caption}>Server: {api.getBaseUrl()}</Text>
           <Text style={styles.caption}>App version {Constants.expoConfig?.version ?? '—'}</Text>
@@ -2496,7 +2676,7 @@ function Portal({
             <>
               <DataCard api={api} value={data} />
               <Card>
-                {field(incident, 'response') ? (
+                {field(incident, 'response') && response.response !== 'no_answer' ? (
                   <>
                     <Text style={styles.successText}>
                       You reported: {savedAnswerLabel(field(incident, 'response'))}
@@ -2511,9 +2691,18 @@ function Portal({
                     {String(field(response, 'review_status') ?? field(incident, 'review_status') ?? '') === 'rejected' ? (
                       <Text style={styles.errorText}>The traffic authority did not accept your answer and may contact you.</Text>
                     ) : null}
+                    {typeof asRecord(field(incident, 'case')).reason === 'string' ? (
+                      <Text style={styles.caption}>Case: {String(asRecord(field(incident, 'case')).reason)}</Text>
+                    ) : null}
                   </>
                 ) : (
                   <>
+                    {response.response === 'no_answer' ? (
+                      <Text style={styles.errorText}>
+                        No answer was given within 30 seconds, so the crash was treated as severe and help may be on the way.
+                        Please answer now.
+                      </Text>
+                    ) : null}
                     <Text style={styles.noticeText}>Please confirm whether this incident involved you.</Text>
                     <Button danger disabled={busy} onPress={() => void answerIncident('need_help', selectedId)} title="Yes — I need help" />
                     <HoldButton disabled={busy} onConfirm={() => void answerIncident('minor_ok', selectedId)} title="Minor, not serious" />
@@ -2833,9 +3022,12 @@ function Portal({
         evidence: _evidence,
         involved_vehicles: _vehicles,
         routes: _routes,
+        case: _case,
+        latest_citizen_response: _latestResponse,
         ...summary
       } = detail;
       const routes = routesFor(detail);
+      const caseOutcome = renderCaseOutcome(detail);
       const rfidStatus = String(field(asRecord(rfidHealth), 'status') ?? 'checking');
       return (
         <View style={styles.stack}>
@@ -2850,6 +3042,7 @@ function Portal({
           {selectedId && data ? (
             <>
               <DataCard api={api} value={summary} />
+              {caseOutcome ? <Card><Text style={styles.cardTitle}>Owner answers</Text>{caseOutcome}</Card> : null}
               {evidence.map((item, index) => {
                 const url = field(asRecord(item), 'url');
                 return typeof url === 'string'
@@ -3012,10 +3205,53 @@ function Portal({
       return (
         <View style={styles.stack}>
           <ScreenTitle title={tab} caption={captions[tab]} />
+          {showLiveCrashes && liveCrashes.length ? (
+            <>
+              <SectionLabel>Live crashes (CARLA)</SectionLabel>
+              {liveCrashes.map((crash, index) => {
+                const vehicle = asRecord(field(crash, 'vehicle'));
+                const partner = asRecord(field(crash, 'partner'));
+                const status = textValue(field(crash, 'status'));
+                return (
+                  <Card key={`${textValue(field(crash, 'incident_key', 'id'))}-${index}`}>
+                    <View style={styles.cardHeading}>
+                      <Text style={[styles.cardTitle, styles.shrink]}>{textValue(field(crash, 'incident_key', 'id'))}</Text>
+                      {status !== '—' ? <Tag tone="warning">{status.replaceAll('_', ' ')}</Tag> : null}
+                    </View>
+                    <Text style={styles.bodyText}>
+                      🚗 Car {textValue(field(vehicle, 'letter'))} · {textValue(field(vehicle, 'plate'))}
+                      {vehicle.owner_name ? ` · ${String(vehicle.owner_name)}` : ''}
+                    </Text>
+                    {partner.plate ? (
+                      <Text style={styles.bodyText}>
+                        🚙 Other car {textValue(field(partner, 'letter'))} · {textValue(field(partner, 'plate'))}
+                        {partner.owner_name ? ` · ${String(partner.owner_name)}` : ''}
+                      </Text>
+                    ) : null}
+                    <Text style={styles.caption}>
+                      {textValue(field(crash, 'location'))} · {displayDate(field(crash, 'created_at'))}
+                      {crash.decision_route_label ? ` · ${String(crash.decision_route_label)}` : ''}
+                    </Text>
+                    {renderCaseOutcome({ case: crash.case, latest_citizen_response: crash.owner_response })
+                      ?? <Text style={styles.caption}>No owner answer yet.</Text>}
+                  </Card>
+                );
+              })}
+              <SectionLabel>Camera / RFID incidents</SectionLabel>
+            </>
+          ) : null}
           {list.length === 0 ? <Empty text={tab === 'Crash Incident Radar' ? 'No crashes are active right now.' : 'Nothing to show yet.'} /> : list.map((item, index) => {
             const record = asRecord(item);
             const id = recordId(record);
-            const { timeline: _timeline, dispatch: _dispatch, citizen_reports: _reports, location: _location, ...display } = record;
+            const {
+              timeline: _timeline,
+              dispatch: _dispatch,
+              citizen_reports: _reports,
+              location: _location,
+              case: _case,
+              latest_citizen_response: _latestResponse,
+              ...display
+            } = record;
             const dispatch = dispatchInfo(field(record, 'dispatch'));
             const reports = asRecord(field(record, 'citizen_reports'));
             const latestAnswer = asRecord(reports.latest);
@@ -3027,6 +3263,7 @@ function Portal({
                 {tab !== 'Pending Verification' && field(record, 'dispatch') ? (
                   <Text style={styles.bodyText}>🚓 {dispatchLine(dispatch, myCenterId)}</Text>
                 ) : null}
+                {tab !== 'Pending Verification' ? renderCaseOutcome(record) : null}
                 {tab !== 'Pending Verification' && latestAnswer.outcome ? (
                   <Text style={latestAnswer.outcome === 'need_help' ? styles.errorText : styles.bodyText}>
                     👤 Citizen: {outcomeLabel(latestAnswer.outcome)} ({displayDate(latestAnswer.responded_at)})
@@ -3176,7 +3413,7 @@ function Portal({
       <View style={[styles.header, { paddingTop: insets.top + 10, paddingLeft: insets.left + 16, paddingRight: insets.right + 16 }]}>
         <View style={styles.shrink}>
           <Text style={styles.brandMarkSmall}>AGHAT SETHU</Text>
-          <Text numberOfLines={1} style={styles.headerTitle}>{labelForRole(role)} portal</Text>
+          <Text numberOfLines={1} style={styles.headerTitle}>{roleLabel} portal</Text>
           <Text numberOfLines={1} style={styles.headerSubtitle}>{savedName || account.email}</Text>
         </View>
         <View style={styles.headerActions}>
@@ -3317,9 +3554,14 @@ function Portal({
                 <Text style={styles.alarmDetail}>Time: {displayDate(field(confirmationIncident, 'occurred_at', 'time'))}</Text>
               </>
             ) : null}
+            {autoReported ? (
+              <Text style={styles.alarmError}>No answer in 30 seconds: reported as a SEVERE accident. Help is being sent. If you are safe, answer below.</Text>
+            ) : answerDeadline !== null ? (
+              <Text style={styles.alarmError}>Answer within {secondsLeft} s, or this is reported as a severe accident and help is sent.</Text>
+            ) : null}
             {renderLocationShare(true)}
             {confirmationMessage ? <Text style={styles.alarmError}>{confirmationMessage}</Text> : null}
-            {alarmMuted ? <Text style={styles.alarmDetail}>Siren silenced. Please still answer below.</Text> : null}
+            {alarmMuted ? <Text style={styles.alarmDetail}>Siren paused for the call. Please still answer below.</Text> : null}
           </>
         ) : (
           <>
@@ -3350,7 +3592,7 @@ function Portal({
           </>
         )}
         message={isCitizen
-          ? 'A crash involving one of your registered vehicles was reported. If you need help, responders will see your live location. This alarm keeps sounding until you answer.'
+          ? 'A crash involving one of your registered vehicles was reported. If you need help, responders will see your live location. This alarm keeps sounding at full volume until you answer.'
           : isOfficer && field(activeAlert, 'dispatch')
             ? 'A crash near your centre was reported. Accept if your centre will respond — the other centres are then released.'
             : 'A new crash was reported. The alarm keeps sounding until you acknowledge it.'}
@@ -3458,6 +3700,15 @@ function BackgroundAlarmCard() {
       ) : null}
       {!status.batteryUnrestricted ? (
         <Button compact onPress={() => CrashMonitor.requestBatteryExemption()} secondary title="Don't pause the alarm to save battery" />
+      ) : null}
+      {!status.dndAccess ? (
+        <>
+          <Text style={styles.caption}>
+            The siren already plays at full alarm volume in silent and vibrate mode. Allow Do Not Disturb access so it also rings
+            through Do Not Disturb.
+          </Text>
+          <Button compact onPress={() => CrashMonitor.openDndSettings()} secondary title="Ring through Do Not Disturb" />
+        </>
       ) : null}
     </Card>
   );

@@ -38,14 +38,54 @@ class CrashMonitorModule : Module() {
     /** Stops monitoring and forgets the session (sign-out). */
     Function("stop") {
       CrashMonitorPrefs(context).clearSession()
+      CrashSiren.stop()
       context.stopService(Intent(context, CrashMonitorService::class.java))
       notifications().cancel(CrashMonitorService.ALARM_ID)
       notifications().cancel(CrashMonitorService.STATUS_ID)
     }
 
-    /** Silences the background alarm once the person has seen the in-app alarm. */
+    /** Removes the background alarm notification once the in-app alarm is showing (the siren keeps going). */
     Function("cancelAlarm") {
       notifications().cancel(CrashMonitorService.ALARM_ID)
+    }
+
+    /**
+     * Starts the siren for an in-app alarm. For a citizen crash (incidentId given) it also starts the
+     * shared 30-second answer countdown, keeping the start time if the background service began it.
+     */
+    Function("startAlarm") { incidentId: String ->
+      val prefs = CrashMonitorPrefs(context)
+      if (incidentId.isNotBlank()) prefs.beginAlarm(incidentId, System.currentTimeMillis())
+      CrashSiren.start(context)
+      alarmState(prefs)
+    }
+
+    Function("alarmState") { alarmState(CrashMonitorPrefs(context)) }
+
+    /** The app reported the unanswered alarm itself; the background service must not report it again. */
+    Function("markAlarmReported") { incidentId: String ->
+      val prefs = CrashMonitorPrefs(context)
+      if (prefs.alarmIncident == incidentId) prefs.alarmReported = true
+    }
+
+    /** The person answered: stop the siren, the countdown and the alarm notification. */
+    Function("endAlarm") {
+      CrashMonitorPrefs(context).clearAlarm()
+      CrashSiren.stop()
+      notifications().cancel(CrashMonitorService.ALARM_ID)
+    }
+
+    /** Stops only the siren (authority alerts, which have no answer countdown). */
+    Function("stopSiren") { CrashSiren.stop() }
+
+    /** Pauses the siren's sound during an emergency call; the alarm stays until it is answered. */
+    Function("setSirenMuted") { muted: Boolean -> CrashSiren.setMuted(muted) }
+
+    /** Do Not Disturb access lets the siren switch DND off while a crash alarm is sounding. */
+    Function("openDndSettings") {
+      context.startActivity(
+        Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+      )
     }
 
     Function("status") {
@@ -56,6 +96,7 @@ class CrashMonitorModule : Module() {
         "notificationsAllowed" to notifications().areNotificationsEnabled(),
         "fullScreenAllowed" to (Build.VERSION.SDK_INT < 34 || notifications().canUseFullScreenIntent()),
         "batteryUnrestricted" to (Build.VERSION.SDK_INT < 23 || power.isIgnoringBatteryOptimizations(context.packageName)),
+        "dndAccess" to CrashSiren.dndAccessGranted(context),
       )
     }
 
@@ -88,6 +129,13 @@ class CrashMonitorModule : Module() {
       }
     }
   }
+
+  private fun alarmState(prefs: CrashMonitorPrefs) = mapOf(
+    "incidentId" to prefs.alarmIncident,
+    "startedAt" to prefs.alarmStartedAt.toDouble(),
+    "reported" to prefs.alarmReported,
+    "timeoutMs" to CrashMonitorService.ANSWER_TIMEOUT_MS.toDouble(),
+  )
 
   private fun notifications() = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 }

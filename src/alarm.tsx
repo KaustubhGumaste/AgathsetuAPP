@@ -15,6 +15,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { CrashMonitor, crashMonitorAvailable } from '../modules/crash-monitor';
 import { dismissNotification, showAlarmNotification } from './notify';
 
 const ALARM_SOUND = require('../assets/sounds/crash_alarm.wav');
@@ -23,25 +24,53 @@ const KEEP_AWAKE_TAG = 'aghat-sethu-crash-alarm';
 const VIBRATION_PATTERN = [0, 900, 450];
 
 /**
- * Drives the physical alarm: looping siren at full volume (also in silent mode and after the app is
- * backgrounded), continuous vibration, screen kept awake and a sticky notification. Everything runs
- * until `active` becomes false — i.e. until the person explicitly answers or acknowledges the alarm.
- * `soundMuted` only stops the siren (for example while dialling emergency services); the popup,
- * vibration and notification stay until the alarm is turned off.
+ * Drives the physical alarm: looping siren, continuous vibration, screen kept awake and a sticky
+ * notification. Everything runs until `active` becomes false — i.e. until the person explicitly
+ * answers or acknowledges the alarm.
+ *
+ * In the installed Android app the siren is native (modules/crash-monitor CrashSiren): it plays on
+ * the ALARM stream, forces the alarm volume to maximum, plays in silent/vibrate mode and, with Do Not
+ * Disturb access, through DND. Elsewhere (Expo Go, iOS) an expo-audio siren is the fallback.
+ * `soundMuted` only pauses the sound (while dialling emergency services); the popup, vibration and
+ * notification stay until the alarm is turned off. `citizenIncidentId` marks a citizen crash alarm,
+ * whose end also clears the shared 30-second answer countdown.
  */
 export function useCrashAlarm({
   active,
   soundMuted = false,
+  citizenIncidentId = '',
   title,
   body,
   data,
 }: {
   active: boolean;
   soundMuted?: boolean;
+  citizenIncidentId?: string;
   title: string;
   body: string;
   data?: Record<string, unknown>;
 }) {
+  const citizenRef = useRef(citizenIncidentId);
+  useEffect(() => {
+    citizenRef.current = citizenIncidentId;
+  }, [citizenIncidentId]);
+
+  // Native siren: started while active, stopped when the alarm is answered or acknowledged.
+  // (A citizen alarm's countdown was already started by raiseCitizenAlarm; this only adds the siren.)
+  useEffect(() => {
+    if (!crashMonitorAvailable || !active) return undefined;
+    CrashMonitor.startAlarm('');
+    return () => {
+      if (citizenRef.current) CrashMonitor.endAlarm();
+      else CrashMonitor.stopSiren();
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (!crashMonitorAvailable || !active) return;
+    CrashMonitor.setSirenMuted(soundMuted);
+  }, [active, soundMuted]);
+
   const player = useRef<AudioPlayer | null>(null);
   const notificationId = useRef<string | null>(null);
   const latest = useRef({ title, body, data });
@@ -50,8 +79,9 @@ export function useCrashAlarm({
     latest.current = { title, body, data };
   }, [title, body, data]);
 
-  // One player for the lifetime of the screen, released on unmount.
+  // Fallback siren (no native module): one player for the lifetime of the screen, released on unmount.
   useEffect(() => {
+    if (crashMonitorAvailable) return undefined;
     const created = createAudioPlayer(ALARM_SOUND);
     created.loop = true;
     created.volume = 1;
@@ -113,7 +143,8 @@ export function useCrashAlarm({
   // Vibration, keep-awake and the sticky notification
   useEffect(() => {
     if (!active) return undefined;
-    Vibration.vibrate(Platform.OS === 'android' ? VIBRATION_PATTERN : 1000, true);
+    // The native siren vibrates as an alarm itself (it keeps going on silent and vibrate-off settings).
+    if (!crashMonitorAvailable) Vibration.vibrate(Platform.OS === 'android' ? VIBRATION_PATTERN : 1000, true);
     void activateKeepAwakeAsync(KEEP_AWAKE_TAG).catch(() => undefined);
     let cancelled = false;
     void showAlarmNotification(latest.current.title, latest.current.body, latest.current.data ?? {})

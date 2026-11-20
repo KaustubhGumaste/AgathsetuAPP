@@ -46,12 +46,46 @@ internal class CrashMonitorPrefs(context: Context) {
     get() = prefs.getBoolean("primed", false)
     set(value) = prefs.edit().putBoolean("primed", value).apply()
 
+  /**
+   * The citizen crash alarm that is sounding now: which incident, when it started (epoch ms) and
+   * whether it was already reported as a severe accident because nobody answered in time.
+   * Shared by the background service and the in-app alarm so the 30-second countdown is the same.
+   */
+  var alarmIncident: String
+    get() = prefs.getString("alarm_incident", "") ?: ""
+    set(value) = prefs.edit().putString("alarm_incident", value).apply()
+
+  var alarmStartedAt: Long
+    get() = prefs.getLong("alarm_started_at", 0L)
+    set(value) = prefs.edit().putLong("alarm_started_at", value).apply()
+
+  var alarmReported: Boolean
+    get() = prefs.getBoolean("alarm_reported", false)
+    set(value) = prefs.edit().putBoolean("alarm_reported", value).apply()
+
+  /** Starts tracking a citizen alarm, keeping the original start time if it is already being tracked. */
+  fun beginAlarm(incidentId: String, now: Long) {
+    if (alarmIncident == incidentId && alarmStartedAt > 0) return
+    prefs.edit()
+      .putString("alarm_incident", incidentId)
+      .putLong("alarm_started_at", now)
+      .putBoolean("alarm_reported", false)
+      .commit()
+  }
+
+  fun clearAlarm() {
+    prefs.edit().remove("alarm_incident").remove("alarm_started_at").remove("alarm_reported").commit()
+  }
+
   fun clearSession() {
     prefs.edit()
       .putBoolean("enabled", false)
       .remove("token")
       .remove("seen")
       .putBoolean("primed", false)
+      .remove("alarm_incident")
+      .remove("alarm_started_at")
+      .remove("alarm_reported")
       .apply()
   }
 }
