@@ -3,6 +3,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Linking, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { ApiError, type ApiClient, asRecord, displayDate } from './api';
+import { type DispatchInfo, canAccept, dispatchInfo, dispatchLine, outcomeLabel } from './dispatch';
 import { type Coordinates, distanceMeters, formatDistance, useWatchedPosition } from './location';
 import { type Palette, colors, themedStyles, useSettings } from './settings';
 
@@ -20,6 +21,8 @@ type MapIncident = {
   severity: string;
   occurredAt: unknown;
   location: (Coordinates & { source: string }) | null;
+  dispatch: DispatchInfo | null;
+  latestAnswer: { outcome: string; at: unknown } | null;
 };
 
 type LiveLocation = Coordinates & {
@@ -68,6 +71,10 @@ export function mapIncident(value: unknown): MapIncident {
     severity: String(record.severity ?? 'unknown'),
     occurredAt: record.occurred_at ?? record.time,
     location: location ? { ...location, source: String(asRecord(record.location).source ?? 'junction') } : null,
+    dispatch: record.dispatch ? dispatchInfo(record.dispatch) : null,
+    latestAnswer: asRecord(asRecord(record.citizen_reports).latest).outcome
+      ? { outcome: String(asRecord(asRecord(record.citizen_reports).latest).outcome), at: asRecord(asRecord(record.citizen_reports).latest).responded_at }
+      : null,
   };
 }
 
@@ -125,14 +132,24 @@ function ago(iso: string | null) {
 
 export function IncidentMap({
   api,
+  busy = false,
   incidents,
+  isOfficer = false,
+  myCenterId = '',
   selectedId,
+  onAccept,
+  onDecline,
   onSelect,
   onOpenEvidence,
 }: {
   api: ApiClient;
+  busy?: boolean;
   incidents: unknown[];
+  isOfficer?: boolean;
+  myCenterId?: string;
   selectedId: string;
+  onAccept?: (id: string) => void;
+  onDecline?: (id: string) => void;
   onSelect: (id: string) => void;
   onOpenEvidence: (id: string) => void;
 }) {
@@ -344,6 +361,12 @@ export function IncidentMap({
                 : `Crash point reported by the detector (${selected.location.latitude.toFixed(5)}, ${selected.location.longitude.toFixed(5)}).`
               : 'The crash report did not include a location.'}
           </Text>
+          {selected.dispatch ? <Text style={styles.bodyText}>🚓 {dispatchLine(selected.dispatch, myCenterId)}</Text> : null}
+          {selected.latestAnswer ? (
+            <Text style={[styles.bodyText, selected.latestAnswer.outcome === 'need_help' ? styles.dangerText : null]}>
+              👤 Citizen: {outcomeLabel(selected.latestAnswer.outcome)} ({displayDate(selected.latestAnswer.at)})
+            </Text>
+          ) : null}
           {live.length > 0 ? live.map((item, index) => (
             <Text key={index} style={[styles.bodyText, item.stale && styles.warnText]}>
               ● {item.name ?? 'Person involved'}: live phone location, updated {ago(item.updatedAt)}
@@ -368,6 +391,18 @@ export function IncidentMap({
           {routeNote ? <Text style={styles.mutedText}>{routeNote}</Text> : null}
 
           <View style={styles.actions}>
+            {selected.dispatch && canAccept(selected.dispatch, myCenterId, isOfficer) ? (
+              <>
+                <Pressable accessibilityRole="button" disabled={busy} onPress={() => onAccept?.(selected.id)} style={[styles.action, styles.actionDanger]}>
+                  <Text style={styles.actionText}>Accept — my centre will respond</Text>
+                </Pressable>
+                {selected.dispatch.myStatus === 'offered' ? (
+                  <Pressable accessibilityRole="button" disabled={busy} onPress={() => onDecline?.(selected.id)} style={[styles.action, styles.actionSecondary]}>
+                    <Text style={styles.actionTextSecondary}>Decline — we cannot respond</Text>
+                  </Pressable>
+                ) : null}
+              </>
+            ) : null}
             {target ? (
               <Pressable accessibilityRole="button" onPress={() => navigateTo(target)} style={[styles.action, styles.actionPrimary]}>
                 <Text style={styles.actionText}>Navigate (turn-by-turn)</Text>
@@ -410,6 +445,7 @@ const styles = themedStyles((c: Palette) => StyleSheet.create({
   badgeMinor: { backgroundColor: c.warningSoft, color: c.warning },
   bodyText: { color: c.textBody, fontSize: 14, lineHeight: 20, marginTop: 4 },
   mutedText: { color: c.textMuted, fontSize: 13, lineHeight: 19, marginTop: 2 },
+  dangerText: { color: c.danger, fontWeight: '700' },
   warnText: { color: c.warning, fontSize: 13, lineHeight: 19, marginTop: 4 },
   statRow: { flexDirection: 'row', gap: 10, marginTop: 10 },
   stat: { backgroundColor: c.surfaceMuted, borderColor: c.border, borderRadius: 12, borderWidth: 1, flex: 1, padding: 12 },

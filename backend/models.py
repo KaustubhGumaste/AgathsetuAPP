@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -27,6 +27,8 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     badge_number: Mapped[str | None] = mapped_column(String(80))
     jurisdiction: Mapped[str | None] = mapped_column(String(120))
+    # Authority officers: the station / control room they respond from (crash dispatch is by centre).
+    center_id: Mapped[str | None] = mapped_column(ForeignKey("authority_centers.id", ondelete="SET NULL"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     vehicles: Mapped[list["Vehicle"]] = relationship(back_populates="owner")
@@ -147,6 +149,8 @@ class IncidentResponse(Base):
     incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"), index=True, nullable=False)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     accident_occurred: Mapped[bool] = mapped_column(nullable=False)
+    # need_help | minor_ok | false_alarm (older rows: derived from accident_occurred).
+    response_kind: Mapped[str | None] = mapped_column(String(20))
     responded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -239,3 +243,45 @@ class IncidentLiveLocation(Base):
     longitude: Mapped[float] = mapped_column(Numeric(10, 7), nullable=False)
     accuracy_m: Mapped[float | None] = mapped_column(Numeric(8, 1))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class AuthorityCenter(Base):
+    """A police station / control room that officers respond from. Crashes are offered to the nearest ones."""
+
+    __tablename__ = "authority_centers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    latitude: Mapped[float] = mapped_column(Numeric(10, 7), nullable=False)
+    longitude: Mapped[float] = mapped_column(Numeric(10, 7), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(30))
+    active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class DispatchOffer(Base):
+    """A crash offered to one authority centre. Exactly one offer per incident can be accepted."""
+
+    __tablename__ = "dispatch_offers"
+    __table_args__ = (
+        UniqueConstraint("incident_id", "center_id", name="uq_dispatch_incident_center"),
+        # The database itself guarantees a single accepting centre, even if two officers tap at once.
+        Index(
+            "uq_dispatch_one_accepted",
+            "incident_id",
+            unique=True,
+            sqlite_where=text("status = 'accepted'"),
+            postgresql_where=text("status = 'accepted'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"), index=True, nullable=False)
+    center_id: Mapped[str] = mapped_column(ForeignKey("authority_centers.id", ondelete="CASCADE"), index=True, nullable=False)
+    # offered | accepted | declined | superseded (another centre accepted) | closed (incident resolved)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="offered", index=True)
+    distance_m: Mapped[int] = mapped_column(Integer, nullable=False)
+    round: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    offered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    responded_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))

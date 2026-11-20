@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class CitizenRegistration(BaseModel):
@@ -51,7 +51,35 @@ class FinePaymentRequest(BaseModel):
 
 
 class CrashConfirmationRequest(BaseModel):
-    accident_occurred: bool
+    # need_help: send help · minor_ok: a small accident, nobody needs help · false_alarm: no accident.
+    outcome: Literal["need_help", "minor_ok", "false_alarm"] | None = None
+    # Older app versions send only this yes/no.
+    accident_occurred: bool | None = None
+
+    @model_validator(mode="after")
+    def require_answer(self) -> "CrashConfirmationRequest":
+        if self.outcome is None and self.accident_occurred is None:
+            raise ValueError("Send outcome (need_help, minor_ok or false_alarm).")
+        return self
+
+
+class CenterCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    phone: str | None = Field(default=None, max_length=30)
+
+
+class CenterUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    phone: str | None = Field(default=None, max_length=30)
+    active: bool | None = None
+
+
+class MyCenterRequest(BaseModel):
+    center_id: str | None = Field(default=None, max_length=36)
 
 
 class GoogleSignInRequest(BaseModel):

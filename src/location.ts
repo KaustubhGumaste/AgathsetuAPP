@@ -149,3 +149,11 @@ export function distanceMeters(a: Coordinates, b: Coordinates) {
 export function formatDistance(meters: number) {
   return meters < 1000 ? `${Math.round(meters)} m` : `${(meters / 1000).toFixed(meters < 10000 ? 1 : 0)} km`;
 }
+
+/** One position fix (asks for permission). Used to place an authority centre where the admin stands. */
+export async function currentPosition(): Promise<Coordinates> {
+  const permission = await Location.requestForegroundPermissionsAsync();
+  if (permission.status !== 'granted') throw new Error('Location permission was not given.');
+  const fix = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+  return { latitude: fix.coords.latitude, longitude: fix.coords.longitude };
+}

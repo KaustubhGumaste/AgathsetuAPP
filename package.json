@@ -35,7 +35,8 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "postinstall": "node scripts/patch-android-cxx-runtime.mjs"
   },
   "private": true
 }

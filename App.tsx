@@ -46,7 +46,8 @@ import { LiveVideo } from './src/LiveVideo';
 import { CrashMonitor, type CrashMonitorStatus, crashMonitorAvailable } from './modules/crash-monitor';
 import { type Palette, SettingsProvider, type ThemeMode, colors, pageStatusBarStyle, themedStyles, useSettings } from './src/settings';
 import { GoogleSignInCancelled, getGoogleIdToken, googleSignInAvailable, googleSignOut } from './src/google';
-import { useCrashLocationShare } from './src/location';
+import { currentPosition, formatDistance, useCrashLocationShare } from './src/location';
+import { type CrashOutcome, canAccept, dispatchInfo, dispatchLine, outcomeLabel } from './src/dispatch';
 import { IncidentMap, mapIncident, severityLabel } from './src/IncidentMap';
 
 type Tab =
@@ -73,13 +74,14 @@ type Tab =
   | 'Vehicle Profile'
   | 'Multi-Junction Tracking'
   | 'Violation Detail'
-  | 'Officer Approvals';
+  | 'Officer Approvals'
+  | 'Authority Centres';
 
 type LiveEvent = Record<string, unknown>;
 type PaymentMethod = 'upi' | 'card' | 'netbanking';
 
-/** The AGHAT SETHU server. Fixed in the app; EXPO_PUBLIC_API_URL can override it for development. */
-const DEFAULT_API_URL = 'https://krishnagumaste.taila639bc.ts.net';
+/** The AGHAT SETHU server: the website's backend, so the app and the authority portal share data. */
+const DEFAULT_API_URL = 'https://aghatsethu.duckdns.org';
 const configuredApiUrl = (process.env.EXPO_PUBLIC_API_URL ?? '').trim() || DEFAULT_API_URL;
 const EMERGENCY_NUMBER = '112';
 
@@ -154,6 +156,18 @@ function recordId(record: Record<string, unknown>) {
   return textValue(field(record, 'id', 'fine_id', 'incident_id', 'job_id', 'reference'));
 }
 
+/** The saved crash answer: the website backend sends {response, label, review_status}; the app's own
+ * backend sends {outcome, accident_occurred}. */
+function savedAnswerLabel(value: unknown): string {
+  if (typeof value === 'string') return value === 'not_serious' ? 'Minor, not serious' : outcomeLabel(value);
+  const answer = asRecord(value);
+  if (typeof answer.label === 'string' && answer.label) return answer.label;
+  const kind = answer.outcome ?? answer.response;
+  if (kind === 'not_serious') return 'Minor, not serious';
+  if (kind === 'need_help' || kind === 'minor_ok' || kind === 'false_alarm') return outcomeLabel(kind);
+  return answer.accident_occurred === true ? 'Accident' : answer.accident_occurred === false ? 'False alarm' : 'Answered';
+}
+
 function labelForRole(role: Role) {
   if (role === 'citizen') return 'Citizen';
   if (role === 'admin') return 'Administrator';
@@ -224,6 +238,8 @@ function routeForTab(
       return selectedId ? `/api/authority/fines/${id}` : '';
     case 'Officer Approvals':
       return '/api/admin/authority-accounts';
+    case 'Authority Centres':
+      return '/api/authority/centers';
     default:
       return '';
   }
@@ -854,6 +870,7 @@ function AuthScreen({
             <Text style={styles.caption}>Authority accounts require approval. Admin and Super Admin accounts are created securely on the backend, not in the app.</Text>
           </Card>
         ) : renderFields()}
+        <AppearanceCard />
         <View style={styles.infoLinks}>
           {(Object.keys(publicInfoPages) as Array<keyof typeof publicInfoPages>).map((key) => (
             <Pressable accessibilityRole="button" key={key} onPress={() => setInfoPage(key)}>
@@ -1186,9 +1203,9 @@ function Portal({
   const allTabs: Tab[] = isCitizen
     ? citizenTabs
     : role === 'admin'
-      ? ['Accident Map', 'Junction Overview', 'Crash Incident Radar', 'Incident Evidence', 'Officer Approvals', 'Settings']
+      ? ['Accident Map', 'Junction Overview', 'Crash Incident Radar', 'Incident Evidence', 'Officer Approvals', 'Authority Centres', 'Settings']
       : role === 'super_admin'
-        ? [...authorityTabs.filter((item) => item !== 'Settings'), 'Officer Approvals', 'Settings']
+        ? [...authorityTabs.filter((item) => item !== 'Settings'), 'Officer Approvals', 'Authority Centres', 'Settings']
         : authorityTabs;
   // Optional sections are probed once; until then they are hidden so nothing flashes an error.
   const [probed, setProbed] = useState(false);
@@ -1262,6 +1279,17 @@ function Portal({
   const locationShare = useCrashLocationShare(api, sharingIncidentId, isCitizen && !portalServer && settings.shareLocation);
   // Authority: the crash selected on the accident map.
   const [mapIncidentId, setMapIncidentId] = useState('');
+  // Officers respond from an authority centre; crashes are offered to the nearest centres only.
+  const isOfficer = role === 'authority';
+  const [myCenterId, setMyCenterId] = useState(typeof account.center_id === 'string' ? account.center_id : '');
+  const myCenterRef = useRef(myCenterId);
+  useEffect(() => { myCenterRef.current = myCenterId; }, [myCenterId]);
+  const [centers, setCenters] = useState<Array<Record<string, unknown>>>([]);
+  const [centerMessage, setCenterMessage] = useState('');
+  const [centerForm, setCenterForm] = useState({ name: '', latitude: '', longitude: '', phone: '' });
+  // Live updates for officers: who accepted, what the citizen answered.
+  const [authorityNotices, setAuthorityNotices] = useState<Array<{ id: string; text: string; tone: 'good' | 'warning' | 'bad' }>>([]);
+  const [citizenAnswers, setCitizenAnswers] = useState<Record<string, Record<string, unknown>>>({});
   const seenNotificationIds = useRef(new Set<string>());
   const notificationsInitialized = useRef(false);
   const answeredIncidents = useRef(new Set<string>());
@@ -1351,9 +1379,11 @@ function Portal({
     if (!crashMonitorAvailable || !api.currentToken || !api.getBaseUrl()) return;
     const path = isCitizen
       ? '/api/citizen/notifications'
-      : api.currentDialect === 'portal' ? '/api/incidents/board?view=radar' : '/api/incidents/board';
+      : api.currentDialect === 'portal'
+        ? '/api/incidents/board?view=radar'
+        : role === 'authority' ? '/api/incidents/board?scope=dispatch' : '/api/incidents/board';
     CrashMonitor.start(api.getBaseUrl(), api.currentToken, isCitizen ? 'citizen' : 'authority', path, 5000);
-  }, [api, isCitizen]);
+  }, [api, isCitizen, role]);
 
   // While the in-app alarm is showing it may cover the lock screen, and it replaces the background
   // monitor's siren so only one plays.
@@ -1424,6 +1454,35 @@ function Portal({
               setFrameData((current) => ({ ...current, [junction]: imageUri }));
             }
             if (eventName !== 'camera_frame' && eventName !== 'vehicle_boxes') setLiveEvent(event);
+            if (eventName === 'dispatch_update') {
+              const incidentId = textValue(field(event, 'incident_id'));
+              const status = String(field(event, 'status') ?? '');
+              setAuthorityAlerts((current) => current.filter((item) => textValue(field(item, 'incident_id', 'id')) !== incidentId));
+              if (status === 'accepted') {
+                const mine = String(field(event, 'center_id') ?? '') === myCenterRef.current;
+                const text = mine
+                  ? `Your centre accepted the crash (${textValue(field(event, 'officer_name'))}).`
+                  : `${textValue(field(event, 'center_name'))} accepted a crash you were alerted to. Your centre is free for other incidents.`;
+                setAuthorityNotices((current) => [{ id: `${incidentId}-accepted`, text, tone: 'good' as const }, ...current].slice(0, 4));
+              }
+            }
+            if (eventName === 'citizen_crash_confirmation') {
+              const incidentId = textValue(field(event, 'incident_id'));
+              const outcome = String(field(event, 'outcome') ?? (field(event, 'accident_occurred') === false ? 'false_alarm' : 'need_help'));
+              setCitizenAnswers((current) => ({ ...current, [incidentId]: event }));
+              const who = textValue(field(event, 'citizen_name'));
+              const where = textValue(field(event, 'junction_id'));
+              const text = `${who} at junction ${where}: ${outcomeLabel(outcome)}.`;
+              setAuthorityNotices((current) => [{ id: `${incidentId}-${outcome}`, text, tone: outcome === 'need_help' ? 'bad' as const : 'warning' as const }, ...current].slice(0, 4));
+              void sendLocalNotification(outcome === 'need_help' ? 'Citizen needs help' : 'Citizen update on a crash', text).catch(() => undefined);
+              // The person is fine: quieten the siren for that crash (it still needs to be checked).
+              if (outcome !== 'need_help') {
+                setAuthorityAlerts((current) => {
+                  if (current.length && textValue(field(current[0], 'incident_id', 'id')) === incidentId) setAlarmMuted(true);
+                  return current;
+                });
+              }
+            }
             if (eventName === 'crash_alert') {
               setAuthorityAlerts((current) => {
                 const incidentId = textValue(field(event, 'incident_id', 'id'));
@@ -1485,8 +1544,79 @@ function Portal({
     }
   }, [api]);
 
-  // Citizen: instant alerts over the WebSocket, with polling as a fallback. The web-portal backend
-  // has no citizen alert socket; there the notification poll below raises the alarm.
+  // Citizen on the website backend: instant alarm over /ws/events. The token is sent in the first
+  // message (never in the URL); the 5-second notification poll below stays as the fallback.
+  const logoutRef = useRef(onLogout);
+  useEffect(() => { logoutRef.current = onLogout; }, [onLogout]);
+  useEffect(() => {
+    if (!isCitizen || !portalServer || !api.currentToken || !api.getBaseUrl()) return undefined;
+    let cancelled = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let retry = 0;
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, Math.min(1000 * 2 ** retry++, 30000));
+    };
+    function connect() {
+      if (cancelled || (socket && socket.readyState <= 1)) return;
+      const token = api.currentToken;
+      if (!token) return;
+      let connection: WebSocket;
+      try {
+        connection = new WebSocket(api.eventsSocketUrl());
+      } catch {
+        scheduleReconnect();
+        return;
+      }
+      socket = connection;
+      connection.onopen = () => connection.send(JSON.stringify({ type: 'auth', token }));
+      connection.onmessage = (message) => {
+        if (typeof message.data !== 'string') return;
+        try {
+          const event = asRecord(JSON.parse(message.data));
+          const type = String(field(event, 'type') ?? '');
+          if (type === 'ready') {
+            retry = 0;
+          } else if (type === 'crash.detected') {
+            const report = asRecord(field(asRecord(field(event, 'data')), 'report'));
+            const incidentKey = String(field(report, 'incident_key') ?? '');
+            if (incidentKey) raiseCitizenAlarm(incidentKey);
+          }
+          // "ping" and other events need no action.
+        } catch {
+          // ignore malformed message
+        }
+      };
+      connection.onclose = (event) => {
+        if (socket === connection) socket = null;
+        if (cancelled) return;
+        if (event.code === 1008) {
+          // The server rejected the session: sign out instead of retrying forever.
+          void logoutRef.current();
+          return;
+        }
+        scheduleReconnect();
+      };
+    }
+    connect();
+    const appState = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && !socket) {
+        retry = 0;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        connect();
+      }
+    });
+    return () => {
+      cancelled = true;
+      appState.remove();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, [api, isCitizen, portalServer, raiseCitizenAlarm]);
+
+  // Citizen on the app's own backend: instant alerts over /ws/citizen/alerts, with polling as a fallback.
   useEffect(() => {
     if (!isCitizen || portalServer || !api.currentToken || !api.getBaseUrl()) return undefined;
     let cancelled = false;
@@ -1513,6 +1643,13 @@ function Portal({
               const notificationId = recordId(notification);
               if (notificationId !== '—') seenNotificationIds.current.add(notificationId);
               raiseCitizenAlarm(incidentId, asRecord(field(event, 'incident')));
+            }
+            if (String(field(event, 'type') ?? '') === 'help_dispatched') {
+              const notificationId = recordId(asRecord(field(event, 'notification')));
+              if (notificationId !== '—') seenNotificationIds.current.add(notificationId);
+              const text = String(field(event, 'message') ?? 'Responders are on the way.');
+              setConfirmationMessage(text);
+              void sendLocalNotification('Help is on the way', text).catch(() => undefined);
             }
           } catch {
             // ignore malformed message
@@ -1765,34 +1902,34 @@ function Portal({
     }
   };
 
-  const answerIncident = async (accidentOccurred: boolean, explicitId?: string) => {
+  const answerIncident = async (outcome: CrashOutcome, explicitId?: string) => {
     const incidentId = explicitId || confirmationIncidentId || selectedId;
     if (!incidentId) return;
     setBusy(true);
     setConfirmationMessage('');
     try {
-      let recorded = accidentOccurred;
-      let savedOnServer = true;
-      if (portalServer) {
-        // The web-portal backend does not take crash-partner answers. Mark the crash notification
-        // read so the alarm is not raised again, and tell the person to call for help directly.
-        savedOnServer = false;
-        const notificationId = crashNotificationIds.current.get(incidentId);
-        if (notificationId) {
-          await api.post(`/api/citizen/notifications/${encodeURIComponent(notificationId)}/read`).catch(() => undefined);
-        }
-      } else {
-        const response = asRecord(await api.post<unknown>(
-          `/api/citizen/incidents/${encodeURIComponent(incidentId)}/confirm`,
-          { accident_occurred: accidentOccurred },
-        ));
-        recorded = field(response, 'accident_occurred') === true;
-      }
+      // Both backends take the answer at the same endpoint (the server marks the crash notification
+      // read). "Minor, not serious" is {"response": "not_serious"} on the website backend and
+      // {"outcome": "minor_ok"} on the app's own backend.
+      const body = portalServer
+        ? outcome === 'minor_ok' ? { response: 'not_serious' } : { accident_occurred: outcome === 'need_help' }
+        : { outcome, accident_occurred: outcome !== 'false_alarm' };
+      const response = asRecord(await api.post<unknown>(
+        `/api/citizen/incidents/${encodeURIComponent(incidentId)}/confirm`,
+        body,
+      ));
+      const saved = field(response, 'outcome', 'response');
+      const recorded: CrashOutcome = saved === 'minor_ok' || saved === 'not_serious'
+        ? 'minor_ok'
+        : saved === 'need_help' || saved === 'false_alarm'
+          ? saved
+          : field(response, 'accident_occurred') === true ? 'need_help' : 'false_alarm';
       answeredIncidents.current.add(incidentId);
-      if (recorded) {
-        // Keep sending the live location so responders can find the person.
+      if (recorded !== 'false_alarm') {
+        // Keep sending the live location so responders can find the person (a minor crash may still be
+        // checked by the police, for a shorter time).
         setSharingIncidentId(incidentId);
-        setShareUntil(Date.now() + 60 * 60 * 1000);
+        setShareUntil(Date.now() + (recorded === 'need_help' ? 60 : 15) * 60 * 1000);
       } else if (sharingIncidentId === incidentId) {
         setSharingIncidentId('');
         setShareUntil(null);
@@ -1801,15 +1938,12 @@ function Portal({
       setAlarmPending(false);
       setAlarmMuted(false);
       setConfirmationMessage(
-        !savedOnServer
-          ? recorded
-            ? `This server cannot receive crash answers from the app. Call ${EMERGENCY_NUMBER} now so help is sent.`
-            : 'Marked as a false alarm on this phone. Thank you.'
-          : recorded
-            ? 'Your response was recorded: accident confirmed. Help has been notified through the control room. Call 112 if anyone is injured.'
-            : 'Your response was recorded: false alarm. Thank you.',
+        recorded === 'need_help'
+          ? `Recorded: you need help. The traffic authorities have been alerted. Call ${EMERGENCY_NUMBER} if anyone is injured.`
+          : recorded === 'minor_ok'
+            ? `Recorded: minor, not serious. The traffic authorities have been informed. Call ${EMERGENCY_NUMBER} if anything changes.`
+            : 'Recorded: false alarm. The traffic authorities have been informed. Thank you.',
       );
-      if (!savedOnServer && recorded) callEmergency();
       setSelectedId(incidentId);
       changeTab('Crash Incident Report', true);
     } catch (reason) {
@@ -1849,6 +1983,123 @@ function Portal({
       setVehicleMessage(reason instanceof Error ? reason.message : 'Could not add the vehicle.');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const removeAuthorityAlert = (incidentId: string) => {
+    setAuthorityAlerts((current) => current.filter((item) => textValue(field(item, 'incident_id', 'id')) !== incidentId));
+    CrashMonitor.cancelAlarm();
+    setAlarmMuted(false);
+  };
+
+  const notify = (text: string, tone: 'good' | 'warning' | 'bad') => {
+    setAuthorityNotices((current) => [{ id: `${Date.now()}`, text, tone }, ...current].slice(0, 4));
+  };
+
+  /** This officer's centre takes the crash; the other offered centres' alarms stop. */
+  const acceptDispatch = async (incidentId: string) => {
+    setBusy(true);
+    try {
+      await api.post(`/api/incidents/${encodeURIComponent(incidentId)}/dispatch/accept`);
+      removeAuthorityAlert(incidentId);
+      notify('Accepted. Your centre is responding — the route to the crash is on the map.', 'good');
+      openMap(incidentId);
+      void refresh({ target: 'Accident Map', silent: true });
+    } catch (reason) {
+      removeAuthorityAlert(incidentId);
+      notify(reason instanceof Error ? reason.message : 'Could not accept this crash.', 'warning');
+      void refresh({ silent: true });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const declineDispatch = async (incidentId: string) => {
+    setBusy(true);
+    try {
+      await api.post(`/api/incidents/${encodeURIComponent(incidentId)}/dispatch/decline`);
+      removeAuthorityAlert(incidentId);
+      notify('Declined. If no nearby centre accepts, the next-nearest centres are asked.', 'warning');
+      void refresh({ silent: true });
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : 'Could not decline this crash.', 'bad');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Authority centres: officers choose theirs; admins add and switch them on or off.
+  const loadCenters = useCallback(async () => {
+    if (isCitizen || portalServer) return;
+    try {
+      const response = asRecord(await api.get<unknown>('/api/authority/centers'));
+      setCenters(asList(response.items).map(asRecord));
+      if (typeof response.my_center_id === 'string') setMyCenterId(response.my_center_id);
+    } catch {
+      // older server without centres: dispatch falls back to alerting every officer
+    }
+  }, [api, isCitizen, portalServer]);
+
+  useEffect(() => {
+    void loadCenters();
+  }, [loadCenters]);
+
+  const chooseCenter = async (centerId: string | null) => {
+    setBusy(true);
+    setCenterMessage('');
+    try {
+      await api.put('/api/authority/me/center', { center_id: centerId });
+      setMyCenterId(centerId ?? '');
+      setCenterMessage(centerId ? 'Saved. Crash alarms near this centre will reach you.' : 'Centre cleared.');
+    } catch (reason) {
+      setCenterMessage(reason instanceof Error ? reason.message : 'Could not save your centre.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveCenter = async () => {
+    const latitude = Number(centerForm.latitude);
+    const longitude = Number(centerForm.longitude);
+    if (centerForm.name.trim().length < 2) return setCenterMessage('Enter the centre name.');
+    if (!centerForm.latitude || !Number.isFinite(latitude) || Math.abs(latitude) > 90) return setCenterMessage('Enter a valid latitude, or use your current location.');
+    if (!centerForm.longitude || !Number.isFinite(longitude) || Math.abs(longitude) > 180) return setCenterMessage('Enter a valid longitude.');
+    setBusy(true);
+    setCenterMessage('');
+    try {
+      await api.post('/api/admin/centers', { name: centerForm.name.trim(), latitude, longitude, phone: centerForm.phone.trim() || null });
+      setCenterForm({ name: '', latitude: '', longitude: '', phone: '' });
+      setCenterMessage('Centre added.');
+      await loadCenters();
+      void refresh({ silent: true });
+    } catch (reason) {
+      setCenterMessage(reason instanceof Error ? reason.message : 'Could not add the centre.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleCenter = async (id: string, active: boolean) => {
+    setBusy(true);
+    try {
+      await api.patch(`/api/admin/centers/${encodeURIComponent(id)}`, { active });
+      await loadCenters();
+      void refresh({ silent: true });
+    } catch (reason) {
+      setCenterMessage(reason instanceof Error ? reason.message : 'Could not update the centre.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fillCenterLocation = async () => {
+    setCenterMessage('Getting your location…');
+    try {
+      const here = await currentPosition();
+      setCenterForm((current) => ({ ...current, latitude: here.latitude.toFixed(6), longitude: here.longitude.toFixed(6) }));
+      setCenterMessage('Location filled in from this phone.');
+    } catch (reason) {
+      setCenterMessage(reason instanceof Error ? reason.message : 'Could not read your location.');
     }
   };
 
@@ -2074,7 +2325,49 @@ function Portal({
                 </View>
               </Card>
             ) : null}
-            {renderAddVehicle(vehicles.length === 0)}
+            {portalServer ? (
+              <Card>
+                <Text style={styles.bodyText}>
+                  Vehicles are linked to your account by AGHAT SETHU when you register with your number plate. Contact the traffic
+                  authority if your vehicle is missing.
+                </Text>
+              </Card>
+            ) : renderAddVehicle(vehicles.length === 0)}
+          </>
+        ) : null}
+
+        {isOfficer ? (
+          <>
+            <SectionLabel>My authority centre</SectionLabel>
+            <Card>
+              <Text style={styles.cardTitle}>Where do you respond from?</Text>
+              <Text style={styles.bodyText}>
+                Crashes are sent only to the nearest centres. Choose yours to receive their alarms and accept them; crashes far
+                away go to other centres.
+              </Text>
+              {centers.length === 0 ? (
+                <Text style={styles.caption}>No centres are set up yet, so every crash alerts every officer. An admin can add centres.</Text>
+              ) : (
+                <View style={styles.methodRow}>
+                  {centers.filter((center) => center.active !== false).map((center) => {
+                    const id = String(center.id ?? '');
+                    return (
+                      <Pressable
+                        accessibilityRole="radio"
+                        accessibilityState={{ checked: myCenterId === id }}
+                        disabled={busy}
+                        key={id}
+                        onPress={() => void chooseCenter(id)}
+                        style={[styles.methodButton, myCenterId === id && styles.methodButtonActive]}
+                      >
+                        <Text style={[styles.methodText, myCenterId === id && styles.methodTextActive]}>{textValue(center.name)}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              )}
+              {centerMessage ? <Text style={centerMessage.startsWith('Saved') ? styles.successText : styles.caption}>{centerMessage}</Text> : null}
+            </Card>
           </>
         ) : null}
 
@@ -2088,7 +2381,7 @@ function Portal({
           </Text>
           <Button onPress={() => void requestNotificationPermission().then((granted) => setProfileMessage(granted ? 'Notifications are allowed.' : 'Notifications are blocked. Allow them in Android Settings › Apps › AGHAT SETHU.'))} secondary title="Check notification permission" />
         </Card>
-        {isCitizen ? (
+        {isCitizen && !portalServer ? (
           <Card>
             <View style={styles.cardHeading}>
               <Text style={[styles.cardTitle, styles.shrink]}>Share my live location in a crash</Text>
@@ -2183,19 +2476,48 @@ function Portal({
           <ScreenTitle title="Crash incident report" caption="Citizen view excludes camera frames and RFID data." />
           {confirmationMessage ? <Card><Text style={styles.successText}>{confirmationMessage}</Text></Card> : null}
           {selectedId && sharingIncidentId === selectedId ? <Card>{renderLocationShare(false)}</Card> : null}
+          {selectedId && field(asRecord(data), 'help') ? (
+            <Card>
+              <Text style={styles.cardTitle}>Help is on the way</Text>
+              <Text style={styles.bodyText}>
+                {textValue(field(asRecord(field(asRecord(data), 'help')), 'center_name'))} accepted your crash alert at{' '}
+                {displayDate(field(asRecord(field(asRecord(data), 'help')), 'accepted_at'))}.
+              </Text>
+              {field(asRecord(field(asRecord(data), 'help')), 'center_phone') ? (
+                <Button
+                  onPress={() => void Linking.openURL(`tel:${String(field(asRecord(field(asRecord(data), 'help')), 'center_phone'))}`)}
+                  secondary
+                  title={`Call ${textValue(field(asRecord(field(asRecord(data), 'help')), 'center_name'))}`}
+                />
+              ) : null}
+            </Card>
+          ) : null}
           {selectedId ? (
             <>
               <DataCard api={api} value={data} />
               <Card>
                 {field(incident, 'response') ? (
-                  <Text style={styles.successText}>
-                    You reported: {field(response, 'accident_occurred') === true ? 'accident confirmed' : 'false alarm'} ({displayDate(field(response, 'responded_at'))}).
-                  </Text>
+                  <>
+                    <Text style={styles.successText}>
+                      You reported: {savedAnswerLabel(field(incident, 'response'))}
+                      {field(response, 'responded_at') ? ` (${displayDate(field(response, 'responded_at'))})` : ''}.
+                    </Text>
+                    {String(field(response, 'review_status') ?? field(incident, 'review_status') ?? '') === 'pending' ? (
+                      <Text style={styles.caption}>Waiting for the traffic authority to check it.</Text>
+                    ) : null}
+                    {String(field(response, 'review_status') ?? field(incident, 'review_status') ?? '') === 'accepted' ? (
+                      <Text style={styles.caption}>The traffic authority accepted your answer.</Text>
+                    ) : null}
+                    {String(field(response, 'review_status') ?? field(incident, 'review_status') ?? '') === 'rejected' ? (
+                      <Text style={styles.errorText}>The traffic authority did not accept your answer and may contact you.</Text>
+                    ) : null}
+                  </>
                 ) : (
                   <>
                     <Text style={styles.noticeText}>Please confirm whether this incident involved you.</Text>
-                    <Button danger disabled={busy} onPress={() => void answerIncident(true, selectedId)} title="Yes, an accident happened" />
-                    <HoldButton disabled={busy} onConfirm={() => void answerIncident(false, selectedId)} title="No, false alarm — I'm safe" />
+                    <Button danger disabled={busy} onPress={() => void answerIncident('need_help', selectedId)} title="Yes — I need help" />
+                    <HoldButton disabled={busy} onConfirm={() => void answerIncident('minor_ok', selectedId)} title="Minor, not serious" />
+                    <HoldButton disabled={busy} onConfirm={() => void answerIncident('false_alarm', selectedId)} title="No accident — false alarm" />
                   </>
                 )}
                 <Button onPress={callEmergency} secondary title={`Call emergency services (${EMERGENCY_NUMBER})`} />
@@ -2231,7 +2553,7 @@ function Portal({
       return (
         <View style={styles.stack}>
           <ScreenTitle title={`Welcome back${savedName ? `, ${savedName}` : ''}`} caption="Citizen dashboard · Bengaluru traffic services" />
-          {vehicleCount === 0 ? renderAddVehicle(true) : null}
+          {vehicleCount === 0 && !portalServer ? renderAddVehicle(true) : null}
           <View style={styles.metricRow}>
             <Metric label="Registered vehicles" value={textValue(field(summary, 'registered_vehicles'))} />
             <Metric label="Fines issued" value={textValue(field(summary, 'fines_issued'))} />
@@ -2334,7 +2656,12 @@ function Portal({
           {unresolved.length > 0 ? (
             <IncidentMap
               api={api}
+              busy={busy}
               incidents={unresolved}
+              isOfficer={isOfficer}
+              myCenterId={myCenterId}
+              onAccept={(id) => void acceptDispatch(id)}
+              onDecline={(id) => void declineDispatch(id)}
               onOpenEvidence={chooseIncident}
               onSelect={setMapIncidentId}
               selectedId={mapIncidentId}
@@ -2421,6 +2748,44 @@ function Portal({
                 : <Empty text="No evidence image is attached to this fine." />}
             </>
           ) : <Button onPress={() => changeTab('Fines & Revenue')} title="Open Fines & Revenue" />}
+        </View>
+      );
+    }
+    if (tab === 'Authority Centres' && (role === 'admin' || role === 'super_admin')) {
+      const list = asList(data, ['items']).map(asRecord);
+      return (
+        <View style={styles.stack}>
+          <ScreenTitle
+            title="Authority centres"
+            caption="Each crash is sent to the 3 nearest active centres (up to 5 within 10 km). The first to accept responds; the others stay free."
+          />
+          <Card>
+            <Text style={styles.cardTitle}>Add a centre</Text>
+            <Input label="Name" maxLength={120} onChangeText={(value) => setCenterForm((current) => ({ ...current, name: value }))} placeholder="Hebbal Traffic Police Station" value={centerForm.name} />
+            <Input label="Latitude" onChangeText={(value) => setCenterForm((current) => ({ ...current, latitude: value }))} placeholder="13.0358" value={centerForm.latitude} />
+            <Input label="Longitude" onChangeText={(value) => setCenterForm((current) => ({ ...current, longitude: value }))} placeholder="77.5970" value={centerForm.longitude} />
+            <Button compact onPress={() => void fillCenterLocation()} secondary title="Use my current location" />
+            <Input keyboardType="phone-pad" label="Phone (optional)" maxLength={30} onChangeText={(value) => setCenterForm((current) => ({ ...current, phone: value }))} value={centerForm.phone} />
+            {centerMessage ? <Text style={centerMessage.startsWith('Centre added') || centerMessage.startsWith('Location filled') ? styles.successText : styles.caption}>{centerMessage}</Text> : null}
+            <Button disabled={busy} onPress={() => void saveCenter()} title="Add centre" />
+          </Card>
+          {list.length === 0 ? <Empty text="No centres yet. Until you add some, every crash alerts every officer." /> : list.map((center) => {
+            const id = String(center.id ?? '');
+            const active = center.active !== false;
+            return (
+              <Card key={id}>
+                <View style={styles.cardHeading}>
+                  <Text style={[styles.cardTitle, styles.shrink]}>{textValue(center.name)}</Text>
+                  <Tag tone={active ? 'good' : 'neutral'}>{active ? 'active' : 'off'}</Tag>
+                </View>
+                <Text style={styles.caption}>
+                  {Number(center.latitude).toFixed(5)}, {Number(center.longitude).toFixed(5)} · {textValue(center.officer_count)} officer(s)
+                  {center.phone ? ` · ${String(center.phone)}` : ''}
+                </Text>
+                <Button compact disabled={busy} onPress={() => void toggleCenter(id, !active)} secondary title={active ? 'Switch off (stop sending crashes)' : 'Switch on'} />
+              </Card>
+            );
+          })}
         </View>
       );
     }
@@ -2650,14 +3015,28 @@ function Portal({
           {list.length === 0 ? <Empty text={tab === 'Crash Incident Radar' ? 'No crashes are active right now.' : 'Nothing to show yet.'} /> : list.map((item, index) => {
             const record = asRecord(item);
             const id = recordId(record);
-            const { timeline: _timeline, ...display } = record;
+            const { timeline: _timeline, dispatch: _dispatch, citizen_reports: _reports, location: _location, ...display } = record;
+            const dispatch = dispatchInfo(field(record, 'dispatch'));
+            const reports = asRecord(field(record, 'citizen_reports'));
+            const latestAnswer = asRecord(reports.latest);
             return (
               <DataCard api={api} key={`${id}-${index}`} onSelect={tab === 'Pending Verification' || id === '—' ? undefined : () => chooseIncident(id)} value={display}>
                 {tab === 'Pending Verification' && id !== '—' ? (
                   <ProtectedImage api={api} path={`/api/authority/pending-verifications/${encodeURIComponent(id)}/snapshot`} />
                 ) : null}
+                {tab !== 'Pending Verification' && field(record, 'dispatch') ? (
+                  <Text style={styles.bodyText}>🚓 {dispatchLine(dispatch, myCenterId)}</Text>
+                ) : null}
+                {tab !== 'Pending Verification' && latestAnswer.outcome ? (
+                  <Text style={latestAnswer.outcome === 'need_help' ? styles.errorText : styles.bodyText}>
+                    👤 Citizen: {outcomeLabel(latestAnswer.outcome)} ({displayDate(latestAnswer.responded_at)})
+                  </Text>
+                ) : null}
                 {tab === 'Crash Incident Radar' && String(field(record, 'status') ?? '') !== 'resolved' ? (
                   <View style={styles.inlineButtons}>
+                    {canAccept(dispatch, myCenterId, isOfficer) ? (
+                      <Button compact danger disabled={busy} onPress={() => void acceptDispatch(id)} title="Accept" />
+                    ) : null}
                     <Button compact onPress={() => openMap(id)} title="Open on map" />
                     <Button compact onPress={() => chooseIncident(id)} secondary title="Incident evidence" />
                     <Button compact onPress={() => changeTab('Live Camera Feeds')} secondary title="View live feed" />
@@ -2802,6 +3181,15 @@ function Portal({
         </View>
         <View style={styles.headerActions}>
           <Pressable
+            accessibilityLabel="Settings"
+            accessibilityRole="button"
+            hitSlop={6}
+            onPress={() => changeTab('Settings')}
+            style={({ pressed }) => [styles.headerButton, tab === 'Settings' && styles.headerButtonActive, pressed && styles.headerButtonPressed]}
+          >
+            <Text style={styles.headerButtonText}>⚙  Settings</Text>
+          </Pressable>
+          <Pressable
             accessibilityLabel="All sections"
             accessibilityRole="button"
             hitSlop={6}
@@ -2848,6 +3236,18 @@ function Portal({
           style={styles.flex}
         >
           {banner ? <Card><Text style={styles.errorText}>{banner}</Text></Card> : null}
+          {isOfficer && centers.length > 0 && !myCenterId ? (
+            <Card>
+              <Text style={styles.errorText}>Choose your authority centre to receive crash alarms for your area.</Text>
+              <Button compact onPress={() => changeTab('Settings')} title="Choose centre" />
+            </Card>
+          ) : null}
+          {authorityNotices.map((notice) => (
+            <Card key={notice.id}>
+              <Text style={notice.tone === 'good' ? styles.successText : notice.tone === 'bad' ? styles.errorText : styles.bodyText}>{notice.text}</Text>
+              <Button compact onPress={() => setAuthorityNotices((current) => current.filter((item) => item.id !== notice.id))} secondary title="Dismiss" />
+            </Card>
+          ))}
           {globalError ? <Card><Text style={styles.errorText}>{globalError}</Text></Card> : null}
           {error ? (
             <Card>
@@ -2925,6 +3325,20 @@ function Portal({
           <>
             <Text style={styles.alarmDetail}>Incident {textValue(field(activeAlert, 'incident_id', 'id'))}</Text>
             <Text style={styles.alarmDetail}>Severity: {severityLabel(field(activeAlert, 'severity'))}</Text>
+            {field(activeAlert, 'dispatch') ? (
+              <Text style={styles.alarmDetail}>
+                {(() => {
+                  const dispatch = dispatchInfo(field(activeAlert, 'dispatch'));
+                  const mine = dispatch.offers.find((offer) => offer.centerId === myCenterId);
+                  return `${mine ? `Your centre is ${formatDistance(mine.distance)} away. ` : ''}${dispatchLine(dispatch, myCenterId)}`;
+                })()}
+              </Text>
+            ) : null}
+            {citizenAnswers[textValue(field(activeAlert, 'incident_id', 'id'))] ? (
+              <Text style={styles.alarmError}>
+                Citizen: {outcomeLabel(field(citizenAnswers[textValue(field(activeAlert, 'incident_id', 'id'))], 'outcome'))}
+              </Text>
+            ) : null}
             {mapIncident(activeAlert).location ? (
               <Text style={styles.alarmDetail}>
                 Location: {mapIncident(activeAlert).location!.latitude.toFixed(5)}, {mapIncident(activeAlert).location!.longitude.toFixed(5)}
@@ -2937,26 +3351,77 @@ function Portal({
         )}
         message={isCitizen
           ? 'A crash involving one of your registered vehicles was reported. If you need help, responders will see your live location. This alarm keeps sounding until you answer.'
-          : 'A new crash was reported. The alarm keeps sounding until you acknowledge it.'}
+          : isOfficer && field(activeAlert, 'dispatch')
+            ? 'A crash near your centre was reported. Accept if your centre will respond — the other centres are then released.'
+            : 'A new crash was reported. The alarm keeps sounding until you acknowledge it.'}
         title={isCitizen ? 'Are you in an accident?' : `Crash at ${textValue(field(activeAlert, 'junction_id', 'junction'))}`}
         visible={alarmActive}
       >
         {isCitizen ? (
           <>
-            <Button danger disabled={busy} onPress={() => void answerIncident(true)} style={styles.alarmButton} title="Yes, I need help" />
-            <HoldButton disabled={busy} inverted onConfirm={() => void answerIncident(false)} style={styles.alarmButton} title="Hold: I'm safe — false alarm" />
+            <Button danger disabled={busy} onPress={() => void answerIncident('need_help')} style={styles.alarmButton} title="Yes, I need help" />
+            <HoldButton disabled={busy} inverted onConfirm={() => void answerIncident('minor_ok')} style={styles.alarmButton} title="Hold: minor, not serious" />
+            <HoldButton disabled={busy} inverted onConfirm={() => void answerIncident('false_alarm')} style={styles.alarmButton} title="Hold: no accident — false alarm" />
             <Button inverted onPress={callEmergency} secondary style={styles.alarmButton} title={`Call ${EMERGENCY_NUMBER} (silences siren)`} />
           </>
         ) : (
           <>
-            <Button danger onPress={() => acknowledgeAuthorityAlert('map')} style={styles.alarmButton} title="Acknowledge and open map" />
-            <Button inverted onPress={() => acknowledgeAuthorityAlert('evidence')} style={styles.alarmButton} title="Acknowledge and open evidence" />
-            <Button inverted onPress={() => acknowledgeAuthorityAlert(false)} secondary style={styles.alarmButton} title="Acknowledge" />
+            {canAccept(dispatchInfo(field(activeAlert, 'dispatch')), myCenterId, isOfficer) ? (
+              <>
+                <Button danger disabled={busy} onPress={() => void acceptDispatch(textValue(field(activeAlert, 'incident_id', 'id')))} style={styles.alarmButton} title="Accept — my centre will respond" />
+                <Button disabled={busy} inverted onPress={() => void declineDispatch(textValue(field(activeAlert, 'incident_id', 'id')))} style={styles.alarmButton} title="Decline — we cannot respond" />
+                <Button inverted onPress={() => acknowledgeAuthorityAlert('map')} secondary style={styles.alarmButton} title="View on map first (still open)" />
+              </>
+            ) : (
+              <>
+                <Button danger onPress={() => acknowledgeAuthorityAlert('map')} style={styles.alarmButton} title="Acknowledge and open map" />
+                <Button inverted onPress={() => acknowledgeAuthorityAlert('evidence')} style={styles.alarmButton} title="Acknowledge and open evidence" />
+                <Button inverted onPress={() => acknowledgeAuthorityAlert(false)} secondary style={styles.alarmButton} title="Acknowledge" />
+              </>
+            )}
             {!alarmMuted ? <Button inverted onPress={() => setAlarmMuted(true)} secondary style={styles.alarmButton} title="Silence siren" /> : null}
           </>
         )}
       </AlarmPopup>
     </View>
+  );
+}
+
+/** Theme choice on the sign-in screen (the full Settings section opens after sign-in). */
+function AppearanceCard() {
+  const settings = useSettings();
+  const [open, setOpen] = useState(false);
+  const options: { value: ThemeMode; label: string }[] = [
+    { value: 'system', label: 'Phone setting' },
+    { value: 'light', label: 'Light' },
+    { value: 'dark', label: 'Dark' },
+  ];
+  return (
+    <Card style={styles.authCard}>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => setOpen((value) => !value)} style={styles.cardHeading}>
+        <Text style={[styles.cardTitle, styles.shrink]}>⚙  Settings</Text>
+        <Text style={styles.revealText}>{open ? 'Hide' : 'Show'}</Text>
+      </Pressable>
+      {open ? (
+        <>
+          <Text style={styles.caption}>Theme</Text>
+          <View style={styles.methodRow}>
+            {options.map((option) => (
+              <Pressable
+                accessibilityRole="radio"
+                accessibilityState={{ checked: settings.themeMode === option.value }}
+                key={option.value}
+                onPress={() => settings.setThemeMode(option.value)}
+                style={[styles.methodButton, settings.themeMode === option.value && styles.methodButtonActive]}
+              >
+                <Text style={[styles.methodText, settings.themeMode === option.value && styles.methodTextActive]}>{option.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+          <Text style={styles.caption}>Profile, vehicles, crash alarm and location settings are under ⚙ Settings after you sign in.</Text>
+        </>
+      ) : null}
+    </Card>
   );
 }
 
@@ -3127,6 +3592,7 @@ const styles = themedStyles((colors: Palette) => StyleSheet.create({
   headerActions: { flexDirection: 'row', gap: 8 },
   headerButton: { borderColor: '#344054', borderRadius: 10, borderWidth: 1, justifyContent: 'center', minHeight: 40, paddingHorizontal: 12 },
   headerButtonPressed: { backgroundColor: '#1D2939' },
+  headerButtonActive: { backgroundColor: '#1D2939', borderColor: '#84ADFF' },
   headerButtonText: { color: '#FFFFFF', fontSize: 13, fontWeight: '800' },
   tabBarWrap: { backgroundColor: colors.surface, borderBottomColor: colors.border, borderBottomWidth: 1 },
   tabScroll: { flexGrow: 0 },

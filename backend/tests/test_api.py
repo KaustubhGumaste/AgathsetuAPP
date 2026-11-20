@@ -646,3 +646,133 @@ def test_incident_route_uses_live_position_and_server_key(api, monkeypatch):
     second = client.get(path, headers=admin).json()
     assert second["destination"] == {"latitude": 13.04, "longitude": 77.6}
     assert client.get(path, headers=citizen).status_code == 403
+
+
+def make_officer(client: TestClient, admin: dict[str, str], email: str, center_id: str | None) -> dict[str, str]:
+    created = client.post(
+        "/api/auth/register/authority",
+        json={"name": f"Officer {email[:6]}", "email": email, "badge_number": email[:10], "jurisdiction": "Bengaluru", "password": "safe-officer-password"},
+    )
+    assert created.status_code == 201, created.text
+    pending = client.get("/api/admin/authority-accounts", headers=admin).json()
+    user_id = next(item["id"] for item in pending["items"] if item["email"] == email)
+    assert client.post(f"/api/admin/authority-accounts/{user_id}/approve", headers=admin).status_code == 200
+    headers = login(client, email, "safe-officer-password")
+    if center_id:
+        assert client.put("/api/authority/me/center", json={"center_id": center_id}, headers=headers).status_code == 200
+    return headers
+
+
+def dispatch_setup(client: TestClient):
+    """Centres at about 1, 2, 3, 6, 12 and 40 km north of junction J02 (13.0358, 77.5970)."""
+    admin = login(client, "admin@test.example", "a-unique-admin-password")
+    km = {"A": 1, "B": 2, "C": 3, "D": 6, "E": 12, "F": 40}
+    centers = {}
+    for name, distance in km.items():
+        response = client.post(
+            "/api/admin/centers",
+            json={"name": f"Centre {name}", "latitude": 13.0358 + distance / 111.2, "longitude": 77.5970, "phone": "100"},
+            headers=admin,
+        )
+        assert response.status_code == 201, response.text
+        centers[name] = response.json()["id"]
+    officers = {name: make_officer(client, admin, f"officer{name.lower()}@police.example", centers[name]) for name in km}
+    return admin, centers, officers
+
+
+def dispatch_ids(client: TestClient, headers: dict[str, str]) -> set[str]:
+    return {item["id"] for item in client.get("/api/incidents/board?scope=dispatch", headers=headers).json()["unresolved"]}
+
+
+def test_crash_goes_to_nearest_centres_and_first_acceptance_wins(api, monkeypatch):
+    client, _application = api
+    citizen = register_citizen(client)
+    admin, centers, officers = dispatch_setup(client)
+
+    ticket = client.post("/api/auth/websocket-ticket", headers=officers["A"]).json()["ticket"]
+    with client.websocket_connect(f"/ws/live-cameras?ticket={ticket}") as socket_a:
+        incident = send_crash(client, "alert-dispatch", ["KA01AB1234"])
+        event = socket_a.receive_json()
+        while event.get("type") != "crash_alert":
+            event = socket_a.receive_json()
+    assert event["incident_id"] == incident
+    # Nearest three always, then more (up to five) only within 10 km: A, B, C and D. E (12 km) and F stay free.
+    offered = {offer["center_name"] for offer in event["dispatch"]["offers"]}
+    assert offered == {"Centre A", "Centre B", "Centre C", "Centre D"}
+    assert incident in dispatch_ids(client, officers["D"])
+    assert incident not in dispatch_ids(client, officers["E"])
+    assert incident not in dispatch_ids(client, officers["F"])
+    # Far centres cannot take it either.
+    assert client.post(f"/api/incidents/{incident}/dispatch/accept", headers=officers["F"]).status_code == 403
+
+    accepted = client.post(f"/api/incidents/{incident}/dispatch/accept", headers=officers["B"])
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["dispatch"]["accepted_center"]["name"] == "Centre B"
+    late = client.post(f"/api/incidents/{incident}/dispatch/accept", headers=officers["A"])
+    assert late.status_code == 409 and "Centre B" in late.json()["detail"]
+    # Other centres' alarms stop; they are free for other crashes.
+    assert incident not in dispatch_ids(client, officers["A"])
+    board = client.get("/api/incidents/board", headers=officers["A"]).json()["unresolved"][0]
+    assert board["dispatch"]["status"] == "accepted" and board["dispatch"]["my_center_status"] == "superseded"
+
+    # The citizen learns which centre is coming.
+    notifications = client.get("/api/citizen/notifications", headers=citizen).json()["items"]
+    assert any(item["kind"] == "help_dispatched" and "Centre B" in item["message"] for item in notifications)
+    assert client.get(f"/api/citizen/incidents/{incident}", headers=citizen).json()["help"]["center_name"] == "Centre B"
+
+    # Resolving closes the remaining offers.
+    assert client.post(f"/api/incidents/{incident}/resolve", json={"password": "a-unique-admin-password"}, headers=admin).status_code == 200
+
+
+def test_declines_escalate_to_next_centres_then_everyone(api):
+    client, _application = api
+    register_citizen(client)
+    admin, centers, officers = dispatch_setup(client)
+    unassigned = make_officer(client, admin, "floating@police.example", None)
+    incident = send_crash(client, "alert-escalate", ["KA01AB1234"])
+    assert incident not in dispatch_ids(client, unassigned)
+
+    for name in "ABCD":
+        assert client.post(f"/api/incidents/{incident}/dispatch/decline", headers=officers[name]).status_code == 200
+    # Everyone near declined: the next-nearest centres are asked.
+    assert incident in dispatch_ids(client, officers["E"]) and incident in dispatch_ids(client, officers["F"])
+    for name in "EF":
+        client.post(f"/api/incidents/{incident}/dispatch/decline", headers=officers[name])
+    # No centre left: every officer is alerted, and any centre can take it, including one never asked.
+    assert incident in dispatch_ids(client, unassigned)
+    extra_center = client.post("/api/admin/centers", json={"name": "Centre G", "latitude": 14.5, "longitude": 77.6}, headers=admin).json()
+    officer_g = make_officer(client, admin, "officerg@police.example", extra_center["id"])
+    accepted = client.post(f"/api/incidents/{incident}/dispatch/accept", headers=officer_g)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["dispatch"]["accepted_center"]["name"] == "Centre G"
+    assert client.post(f"/api/incidents/{incident}/dispatch/accept", headers=officers["C"]).status_code == 409
+    assert incident not in dispatch_ids(client, unassigned)
+
+
+def test_citizen_minor_or_false_alarm_answer_is_saved_and_sent_to_authorities(api):
+    client, _application = api
+    citizen = register_citizen(client)
+    admin = login(client, "admin@test.example", "a-unique-admin-password")
+    minor = send_crash(client, "alert-minor", ["KA01AB1234"])
+    old_app = send_crash(client, "alert-old", ["KA01AB1234"])
+
+    ticket = client.post("/api/auth/websocket-ticket", headers=admin).json()["ticket"]
+    with client.websocket_connect(f"/ws/live-cameras?ticket={ticket}") as live:
+        answer = client.post(f"/api/citizen/incidents/{minor}/confirm", json={"outcome": "minor_ok"}, headers=citizen)
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["outcome"] == "minor_ok" and answer.json()["accident_occurred"] is True
+        event = live.receive_json()
+        while event.get("type") != "citizen_crash_confirmation":
+            event = live.receive_json()
+    assert event["outcome"] == "minor_ok" and event["citizen_name"] == "Aarav Sharma"
+    assert event["citizen_reports"]["minor_ok"] == 1
+
+    detail = client.get(f"/api/incidents/{minor}", headers=admin).json()
+    assert detail["citizen_reports"]["latest"]["outcome"] == "minor_ok"
+    assert client.get(f"/api/citizen/incidents/{minor}", headers=citizen).json()["response"]["outcome"] == "minor_ok"
+
+    # Older app versions still send only accident_occurred.
+    legacy = client.post(f"/api/citizen/incidents/{old_app}/confirm", json={"accident_occurred": False}, headers=citizen)
+    assert legacy.json()["outcome"] == "false_alarm"
+    assert client.get(f"/api/incidents/{old_app}", headers=admin).json()["citizen_reports"]["false_alarm"] == 1
+    assert client.post(f"/api/citizen/incidents/{old_app}/confirm", json={}, headers=citizen).status_code == 422

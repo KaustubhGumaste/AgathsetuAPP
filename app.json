@@ -47,6 +47,7 @@
       "expo-secure-store",
       "expo-video",
       "./plugins/with-loopback-cleartext",
+      "./plugins/with-cxx-runtime",
       "expo-status-bar",
       [
         "expo-audio",

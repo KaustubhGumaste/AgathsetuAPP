@@ -17,13 +17,15 @@ import jwt
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import Engine, delete, func, or_, select
+from sqlalchemy import Engine, delete, func, inspect, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from . import email_otp, google_auth
 from .database import Base, engine
 from .models import (
+    AuthorityCenter,
+    DispatchOffer,
     EmailOtp,
     Fine,
     Incident,
@@ -51,6 +53,9 @@ from .schemas import (
     EmailOtpRequest,
     EmailOtpVerify,
     AddVehicleRequest,
+    CenterCreate,
+    CenterUpdate,
+    MyCenterRequest,
     FinePaymentRequest,
     GoogleSignInRequest,
     LiveLocationUpdate,
@@ -85,6 +90,37 @@ DEFAULT_JUNCTION_COORDINATES = {
     "J03": (13.0075, 77.6950),
 }
 LIVE_LOCATION_STALE_SECONDS = 120
+RESPONSE_KINDS = ("need_help", "minor_ok", "false_alarm")
+
+
+def response_kind(response: IncidentResponse) -> str:
+    """What the citizen answered; rows from before the three-way answer only stored a yes/no."""
+    if response.response_kind in RESPONSE_KINDS:
+        return response.response_kind
+    return "need_help" if response.accident_occurred else "false_alarm"
+
+
+def distance_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    from math import asin, cos, radians, sin, sqrt
+
+    d_lat = radians(b[0] - a[0])
+    d_lng = radians(b[1] - a[1])
+    h = sin(d_lat / 2) ** 2 + cos(radians(a[0])) * cos(radians(b[0])) * sin(d_lng / 2) ** 2
+    return 2 * 6371000 * asin(sqrt(h))
+
+
+def public_center(center: AuthorityCenter, officer_count: int | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": center.id,
+        "name": center.name,
+        "latitude": float(center.latitude),
+        "longitude": float(center.longitude),
+        "phone": center.phone,
+        "active": center.active,
+    }
+    if officer_count is not None:
+        result["officer_count"] = officer_count
+    return result
 
 
 def junction_coordinates() -> dict[str, tuple[float, float]]:
@@ -188,6 +224,7 @@ def public_user(user: User) -> dict[str, Any]:
     if user.role != "citizen":
         result["badge_number"] = user.badge_number
         result["jurisdiction"] = user.jurisdiction
+        result["center_id"] = user.center_id
     return result
 
 
@@ -343,9 +380,14 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             return user
         return dependency
 
-    async def broadcast(event: dict[str, Any]) -> None:
+    async def send_to_authorities(event: dict[str, Any], user_ids: set[str] | None = None) -> None:
+        """Sends to connected authority / admin sockets: all of them, or only those of `user_ids`."""
         async with application.state.socket_lock:
-            sockets = list(application.state.authority_sockets)
+            sockets = [
+                socket
+                for socket, socket_user_id in application.state.authority_sockets.items()
+                if user_ids is None or socket_user_id in user_ids
+            ]
         stale: list[WebSocket] = []
         for socket in sockets:
             try:
@@ -355,7 +397,162 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         if stale:
             async with application.state.socket_lock:
                 for socket in stale:
-                    application.state.authority_sockets.discard(socket)
+                    application.state.authority_sockets.pop(socket, None)
+
+    async def broadcast(event: dict[str, Any]) -> None:
+        await send_to_authorities(event)
+
+    # ---------------- crash dispatch to the nearest authority centres ----------------
+    dispatch_min = max(1, int(os.getenv("DISPATCH_MIN_CENTERS", "3")))
+    dispatch_max = max(dispatch_min, int(os.getenv("DISPATCH_MAX_CENTERS", "5")))
+    dispatch_radius_m = float(os.getenv("DISPATCH_RADIUS_KM", "10")) * 1000
+    dispatch_escalate_s = float(os.getenv("DISPATCH_ESCALATE_SECONDS", "120"))
+
+    def admin_ids(db: Session) -> set[str]:
+        return set(db.scalars(select(User.id).where(User.role.in_(("admin", "super_admin")), User.status == "active")).all())
+
+    def officer_ids(db: Session, center_ids: set[str]) -> set[str]:
+        if not center_ids:
+            return set()
+        return set(db.scalars(
+            select(User.id).where(User.role == "authority", User.status == "active", User.center_id.in_(center_ids))
+        ).all())
+
+    def incident_offers(db: Session, incident_id: str) -> list[DispatchOffer]:
+        return list(db.scalars(select(DispatchOffer).where(DispatchOffer.incident_id == incident_id)).all())
+
+    def incident_audience(db: Session, incident: Incident) -> set[str] | None:
+        """Who follows this crash: the offered centres' officers and the admins (None = every officer)."""
+        offers = incident_offers(db, incident.id)
+        if not offers or incident.id in application.state.dispatch_escalated_all:
+            return None
+        return officer_ids(db, {offer.center_id for offer in offers}) | admin_ids(db)
+
+    def dispatch_summary(db: Session, incident: Incident, viewer: User | None = None) -> dict[str, Any]:
+        offers = sorted(incident_offers(db, incident.id), key=lambda offer: offer.distance_m)
+        if not offers:
+            return {"mode": "broadcast", "status": "open", "offers": [], "my_center_status": None, "accepted_center": None}
+        centers = {
+            center.id: center
+            for center in db.scalars(select(AuthorityCenter).where(AuthorityCenter.id.in_({offer.center_id for offer in offers}))).all()
+        }
+        accepted = next((offer for offer in offers if offer.status == "accepted"), None)
+        accepted_by = db.get(User, accepted.responded_by) if accepted and accepted.responded_by else None
+        mine = next((offer for offer in offers if viewer is not None and offer.center_id == viewer.center_id), None)
+        return {
+            "mode": "all_officers" if incident.id in application.state.dispatch_escalated_all else "dispatched",
+            "status": "accepted" if accepted else ("closed" if incident.status == "resolved" else "awaiting"),
+            "accepted_center": (
+                {**public_center(centers[accepted.center_id]), "distance_m": accepted.distance_m}
+                if accepted and accepted.center_id in centers else None
+            ),
+            "accepted_by": accepted_by.name if accepted_by else None,
+            "accepted_at": iso(accepted.responded_at) if accepted else None,
+            "offers": [
+                {
+                    "center_id": offer.center_id,
+                    "center_name": centers[offer.center_id].name if offer.center_id in centers else "—",
+                    "distance_m": offer.distance_m,
+                    "status": offer.status,
+                    "round": offer.round,
+                }
+                for offer in offers
+            ],
+            "offered_center_ids": [offer.center_id for offer in offers if offer.status in ("offered", "declined")],
+            "my_center_status": mine.status if mine else None,
+        }
+
+    def citizen_reports(db: Session, incident: Incident) -> dict[str, Any]:
+        responses = db.scalars(
+            select(IncidentResponse).where(IncidentResponse.incident_id == incident.id).order_by(IncidentResponse.responded_at.desc())
+        ).all()
+        counts = {kind: 0 for kind in RESPONSE_KINDS}
+        for item in responses:
+            counts[response_kind(item)] += 1
+        latest = responses[0] if responses else None
+        return {
+            **counts,
+            "responses": len(responses),
+            "latest": {"outcome": response_kind(latest), "responded_at": iso(latest.responded_at)} if latest else None,
+        }
+
+    def authority_incident(db: Session, incident: Incident, viewer: User | None) -> dict[str, Any]:
+        return {**public_incident(incident), "dispatch": dispatch_summary(db, incident, viewer), "citizen_reports": citizen_reports(db, incident)}
+
+    def offer_next_centers(db: Session, incident: Incident) -> list[DispatchOffer]:
+        """Offers the crash to the nearest centres not yet asked: at least the nearest `dispatch_min`, and up to
+        `dispatch_max` while they are within `dispatch_radius_m`. Far-away centres are left free."""
+        location = incident_location(incident)
+        if location is None:
+            return []
+        point = (location["latitude"], location["longitude"])
+        already = {offer.center_id for offer in incident_offers(db, incident.id)}
+        rounds = [offer.round for offer in incident_offers(db, incident.id)]
+        candidates = sorted(
+            (
+                (distance_m(point, (float(center.latitude), float(center.longitude))), center)
+                for center in db.scalars(select(AuthorityCenter).where(AuthorityCenter.active.is_(True))).all()
+                if center.id not in already
+            ),
+            key=lambda item: item[0],
+        )
+        chosen = candidates[:dispatch_min] + [
+            item for item in candidates[dispatch_min:dispatch_max] if item[0] <= dispatch_radius_m
+        ]
+        next_round = (max(rounds) + 1) if rounds else 1
+        offers = [
+            DispatchOffer(incident_id=incident.id, center_id=center.id, distance_m=int(round(distance)), round=next_round)
+            for distance, center in chosen
+        ]
+        db.add_all(offers)
+        return offers
+
+    async def alert_offered_centers(db: Session, incident: Incident, offers: list[DispatchOffer], escalated: bool = False) -> None:
+        targets = officer_ids(db, {offer.center_id for offer in offers}) | admin_ids(db)
+        await send_to_authorities(
+            {"type": "crash_alert", **authority_incident(db, incident, None), "escalated": escalated},
+            targets,
+        )
+
+    async def escalate_dispatch(incident_id: str) -> None:
+        """Nobody accepted (all declined, or no answer in time): offer the next-nearest centres; when
+        none are left, alert every officer."""
+        with factory() as db:
+            incident = db.get(Incident, incident_id)
+            if incident is None or incident.status != "unresolved" or incident_id in application.state.dispatch_escalated_all:
+                return
+            if any(offer.status == "accepted" for offer in incident_offers(db, incident_id)):
+                return
+            offers = offer_next_centers(db, incident)
+            db.commit()
+            if offers:
+                await alert_offered_centers(db, incident, offers, escalated=True)
+                schedule_escalation(incident_id)
+                return
+            application.state.dispatch_escalated_all.add(incident_id)
+            await send_to_authorities({"type": "crash_alert", **authority_incident(db, incident, None), "escalated": True})
+
+    def schedule_escalation(incident_id: str) -> None:
+        if dispatch_escalate_s <= 0:
+            return
+
+        async def later() -> None:
+            await asyncio.sleep(dispatch_escalate_s)
+            await escalate_dispatch(incident_id)
+
+        task = asyncio.create_task(later())
+        application.state.dispatch_tasks.add(task)
+        task.add_done_callback(application.state.dispatch_tasks.discard)
+
+    async def raise_crash_alert(db: Session, incident: Incident) -> None:
+        """New crash: alert the nearest centres only. Without centres (or a crash location), every officer."""
+        offers = offer_next_centers(db, incident)
+        db.commit()
+        if offers:
+            await alert_offered_centers(db, incident, offers)
+            schedule_escalation(incident.id)
+        else:
+            await send_to_authorities({"type": "crash_alert", **authority_incident(db, incident, None)})
 
     async def notify_citizen(user_id: str, event: dict[str, Any]) -> None:
         async with application.state.socket_lock:
@@ -387,9 +584,38 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         db.commit()
         logger.warning("Created bootstrap admin account from environment configuration.")
 
+    def add_missing_columns() -> None:
+        """create_all() makes new tables but never alters existing ones: add the new nullable columns."""
+        wanted = {
+            "users": [("center_id", "VARCHAR(36) REFERENCES authority_centers(id) ON DELETE SET NULL")],
+            "incident_responses": [("response_kind", "VARCHAR(20)")],
+        }
+        inspector = inspect(database_engine)
+        with database_engine.begin() as connection:
+            for table, columns in wanted.items():
+                existing = {column["name"] for column in inspector.get_columns(table)}
+                for name, ddl in columns:
+                    if name not in existing:
+                        connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+    def seed_centers(db: Session) -> None:
+        """AUTHORITY_CENTERS="Name|latitude|longitude|phone;..." creates centres on first start."""
+        if db.scalar(select(func.count()).select_from(AuthorityCenter)):
+            return
+        for entry in os.getenv("AUTHORITY_CENTERS", "").split(";"):
+            parts = [part.strip() for part in entry.split("|")]
+            if len(parts) < 3 or not parts[0]:
+                continue
+            latitude, longitude = _coordinate(parts[1], -90, 90), _coordinate(parts[2], -180, 180)
+            if latitude is None or longitude is None:
+                continue
+            db.add(AuthorityCenter(name=parts[0][:120], latitude=latitude, longitude=longitude, phone=(parts[3][:30] if len(parts) > 3 and parts[3] else None)))
+        db.commit()
+
     def initialize_database() -> None:
         MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
         Base.metadata.create_all(database_engine)
+        add_missing_columns()
         with factory() as db:
             db.execute(delete(RevokedToken).where(RevokedToken.expires_at < utcnow()))
             for junction_id in JUNCTION_IDS:
@@ -399,11 +625,14 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
                     db.add(LiveCamera(id=f"CAM-{junction_id}", junction_id=junction_id))
             db.commit()
             create_bootstrap_admin(db)
+            seed_centers(db)
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         initialize_database()
         yield
+        for task in list(application.state.dispatch_tasks):
+            task.cancel()
 
     application = FastAPI(
         title="AGHAT SETHU API",
@@ -412,7 +641,9 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         lifespan=lifespan,
     )
     application.state.session_factory = factory
-    application.state.authority_sockets = set()
+    application.state.authority_sockets = {}
+    application.state.dispatch_tasks = set()
+    application.state.dispatch_escalated_all = set()
     application.state.citizen_sockets = set()
     application.state.socket_lock = asyncio.Lock()
     application.state.websocket_tickets = {}
@@ -911,10 +1142,13 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         )
         result = public_incident(incident, citizen=True)
         result["response"] = (
-            {"accident_occurred": response.accident_occurred, "responded_at": iso(response.responded_at)}
+            {"accident_occurred": response.accident_occurred, "outcome": response_kind(response), "responded_at": iso(response.responded_at)}
             if response
             else None
         )
+        accepted = db.scalar(select(DispatchOffer).where(DispatchOffer.incident_id == incident.id, DispatchOffer.status == "accepted"))
+        center = db.get(AuthorityCenter, accepted.center_id) if accepted else None
+        result["help"] = {"center_name": center.name, "center_phone": center.phone, "accepted_at": iso(accepted.responded_at)} if center else None
         return result
 
     @application.post("/api/citizen/incidents/{incident_id}/confirm")
@@ -936,28 +1170,39 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
         response = db.scalar(
             select(IncidentResponse).where(IncidentResponse.incident_id == incident.id, IncidentResponse.user_id == user.id)
         )
+        outcome = request.outcome or ("need_help" if request.accident_occurred else "false_alarm")
+        accident_occurred = outcome != "false_alarm"
         if response is None:
             response = IncidentResponse(
                 incident_id=incident.id,
                 user_id=user.id,
-                accident_occurred=request.accident_occurred,
+                accident_occurred=accident_occurred,
+                response_kind=outcome,
             )
             db.add(response)
         else:
-            response.accident_occurred = request.accident_occurred
+            response.accident_occurred = accident_occurred
+            response.response_kind = outcome
             response.responded_at = utcnow()
         db.commit()
         result = {
             "incident_id": incident.id,
             "accident_occurred": response.accident_occurred,
+            "outcome": outcome,
             "responded_at": iso(response.responded_at),
         }
-        await broadcast(
+        # Saved on the incident (citizen_reports) and pushed to the officers following this crash.
+        await send_to_authorities(
             {
                 "type": "citizen_crash_confirmation",
                 **result,
                 "citizen_id": user.id,
-            }
+                "citizen_name": user.name,
+                "citizen_mobile": user.mobile,
+                "junction_id": incident.junction_id,
+                "citizen_reports": citizen_reports(db, incident),
+            },
+            incident_audience(db, incident),
         )
         return result
 
@@ -1294,17 +1539,30 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
 
     @application.get("/api/incidents/board")
     async def incidents_board(
-        _user: User = Depends(require_roles("authority", "admin")),
+        scope: str | None = None,
+        user: User = Depends(require_roles("authority", "admin")),
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
         unresolved = db.scalars(select(Incident).where(Incident.status == "unresolved").order_by(Incident.occurred_at.desc())).all()
+        if scope == "dispatch" and user.role == "authority":
+            # The background alarm list of an officer: crashes offered to their centre and not yet taken,
+            # plus crashes sent to every officer (no centres configured, or escalated to all).
+            def waiting_for_me(incident: Incident) -> bool:
+                offers = incident_offers(db, incident.id)
+                if not offers or incident.id in application.state.dispatch_escalated_all:
+                    return not any(offer.status == "accepted" for offer in offers)
+                if any(offer.status == "accepted" for offer in offers):
+                    return False
+                return any(offer.center_id == user.center_id and offer.status == "offered" for offer in offers)
+
+            unresolved = [incident for incident in unresolved if waiting_for_me(incident)]
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         resolved_today = db.scalars(
             select(Incident).where(Incident.status == "resolved", Incident.resolved_at >= today_start).order_by(Incident.resolved_at.desc())
         ).all()
         return {
-            "unresolved": [public_incident(item) for item in unresolved],
-            "resolved_today": [public_incident(item) for item in resolved_today],
+            "unresolved": [authority_incident(db, item, user) for item in unresolved],
+            "resolved_today": [authority_incident(db, item, user) for item in resolved_today],
             "updated_at": iso(utcnow()),
         }
 
@@ -1317,13 +1575,13 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
     @application.get("/api/incidents/{incident_id}")
     async def incident_detail(
         incident_id: str,
-        _user: User = Depends(require_roles("authority", "admin")),
+        user: User = Depends(require_roles("authority", "admin")),
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
         incident = authority_incident_or_404(incident_id, db)
         tags = db.scalars(select(IncidentTag).where(IncidentTag.incident_id == incident.id)).all()
         sightings = db.scalars(select(Sighting).where(Sighting.incident_id == incident.id).order_by(Sighting.seen_at)).all()
-        result = public_incident(incident)
+        result = authority_incident(db, incident, user)
         result["crash_zone_rfid_snapshot"] = [
             {
                 "epc": tag.epc,
@@ -1459,12 +1717,193 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             incident.status = "resolved"
             incident.resolved_by = user.id
             incident.resolved_at = utcnow()
+            for offer in incident_offers(db, incident.id):
+                if offer.status in ("offered", "declined"):
+                    offer.status = "closed"
             db.commit()
+            await send_to_authorities(
+                {"type": "dispatch_update", "incident_id": incident.id, "status": "resolved", "dispatch": dispatch_summary(db, incident)},
+                incident_audience(db, incident),
+            )
         return {
             "incident_id": incident.id,
             "status": incident.status,
             "resolved_at": iso(incident.resolved_at),
         }
+
+    def offer_for_officer(db: Session, incident: Incident, user: User) -> DispatchOffer:
+        if not user.center_id:
+            raise HTTPException(status_code=400, detail="Choose your authority centre in Settings first.")
+        offer = db.scalar(
+            select(DispatchOffer).where(DispatchOffer.incident_id == incident.id, DispatchOffer.center_id == user.center_id)
+        )
+        if offer is None:
+            raise HTTPException(status_code=403, detail="This crash was not sent to your centre. Nearer centres are handling it.")
+        return offer
+
+    @application.post("/api/incidents/{incident_id}/dispatch/accept")
+    async def accept_dispatch(
+        incident_id: str,
+        user: User = Depends(require_roles("authority")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """First centre to accept takes the crash; the other centres' alarms stop and they stay free."""
+        incident = authority_incident_or_404(incident_id, db)
+        if incident.status != "unresolved":
+            raise HTTPException(status_code=409, detail="This crash is already resolved.")
+        if incident.id in application.state.dispatch_escalated_all and user.center_id and not db.scalar(
+            select(DispatchOffer.id).where(DispatchOffer.incident_id == incident.id, DispatchOffer.center_id == user.center_id)
+        ):
+            # Escalated to every officer: any centre may take it.
+            center = db.get(AuthorityCenter, user.center_id)
+            location = incident_location(incident)
+            gap = distance_m((location["latitude"], location["longitude"]), (float(center.latitude), float(center.longitude))) if center and location else 0
+            rounds = [item.round for item in incident_offers(db, incident.id)]
+            db.add(DispatchOffer(incident_id=incident.id, center_id=user.center_id, distance_m=int(gap), round=(max(rounds) + 1) if rounds else 1))
+            db.flush()
+        offer = offer_for_officer(db, incident, user)
+        if offer.status == "accepted":
+            return {"incident_id": incident.id, "accepted": True, "dispatch": dispatch_summary(db, incident, user)}
+        def taken_message() -> str:
+            accepted = db.scalar(select(DispatchOffer).where(DispatchOffer.incident_id == incident.id, DispatchOffer.status == "accepted"))
+            center = db.get(AuthorityCenter, accepted.center_id) if accepted else None
+            return f"Already accepted by {center.name if center else 'another centre'}."
+        if any(item.status == "accepted" for item in incident_offers(db, incident.id)):
+            raise HTTPException(status_code=409, detail=taken_message())
+        if offer.status not in ("offered", "declined"):
+            raise HTTPException(status_code=409, detail="This offer is no longer open.")
+        now = utcnow()
+        offer.status = "accepted"
+        offer.responded_at = now
+        offer.responded_by = user.id
+        for other in incident_offers(db, incident.id):
+            if other.id != offer.id and other.status in ("offered", "declined"):
+                other.status = "superseded"
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=taken_message()) from None
+        center = db.get(AuthorityCenter, offer.center_id)
+        center_name = center.name if center else "An authority centre"
+        summary = dispatch_summary(db, incident, user)
+        await send_to_authorities(
+            {
+                "type": "dispatch_update",
+                "incident_id": incident.id,
+                "status": "accepted",
+                "center_id": offer.center_id,
+                "center_name": center_name,
+                "officer_name": user.name,
+                "dispatch": summary,
+            },
+            incident_audience(db, incident),
+        )
+        # Tell the people involved that help is on the way.
+        plates = json_list(incident.involved_plates_json)
+        owners = set(db.scalars(select(Vehicle.owner_id).where(Vehicle.plate.in_(plates), Vehicle.owner_id.is_not(None))).all()) if plates else set()
+        message = f"{center_name} accepted your crash alert. Responders are on the way."
+        for owner_id in owners:
+            notification = Notification(user_id=owner_id, kind="help_dispatched", message=message, incident_id=incident.id)
+            db.add(notification)
+            db.flush()
+            await notify_citizen(owner_id, {"type": "help_dispatched", "incident_id": incident.id, "message": message, "notification": public_notification(notification)})
+        db.commit()
+        return {"incident_id": incident.id, "accepted": True, "dispatch": summary}
+
+    @application.post("/api/incidents/{incident_id}/dispatch/decline")
+    async def decline_dispatch(
+        incident_id: str,
+        user: User = Depends(require_roles("authority")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """This centre cannot go. When every offered centre has declined, the next-nearest are asked."""
+        incident = authority_incident_or_404(incident_id, db)
+        offer = offer_for_officer(db, incident, user)
+        if offer.status != "offered":
+            return {"incident_id": incident.id, "declined": offer.status == "declined", "dispatch": dispatch_summary(db, incident, user)}
+        offer.status = "declined"
+        offer.responded_at = utcnow()
+        offer.responded_by = user.id
+        db.commit()
+        if incident.status == "unresolved" and not any(item.status in ("offered", "accepted") for item in incident_offers(db, incident.id)):
+            await escalate_dispatch(incident.id)
+        db.expire_all()
+        return {"incident_id": incident.id, "declined": True, "dispatch": dispatch_summary(db, incident, user)}
+
+    @application.get("/api/authority/centers")
+    async def list_centers(
+        user: User = Depends(require_roles("authority", "admin")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        query = select(AuthorityCenter).order_by(AuthorityCenter.name)
+        if user.role == "authority":
+            query = query.where(AuthorityCenter.active.is_(True))
+        centers = db.scalars(query).all()
+        counts = dict(db.execute(
+            select(User.center_id, func.count()).where(User.role == "authority", User.status == "active", User.center_id.is_not(None)).group_by(User.center_id)
+        ).all())
+        return {"items": [public_center(center, counts.get(center.id, 0)) for center in centers], "my_center_id": user.center_id}
+
+    @application.post("/api/admin/centers", status_code=201)
+    async def create_center(
+        request: CenterCreate,
+        _user: User = Depends(require_roles("admin")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        center = AuthorityCenter(
+            name=request.name.strip(),
+            latitude=request.latitude,
+            longitude=request.longitude,
+            phone=(request.phone or "").strip() or None,
+        )
+        db.add(center)
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="A centre with this name already exists.") from error
+        return public_center(center, 0)
+
+    @application.patch("/api/admin/centers/{center_id}")
+    async def update_center(
+        center_id: str,
+        request: CenterUpdate,
+        _user: User = Depends(require_roles("admin")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        center = db.get(AuthorityCenter, center_id)
+        if center is None:
+            raise HTTPException(status_code=404, detail="Centre not found.")
+        for name in ("latitude", "longitude", "active"):
+            value = getattr(request, name)
+            if value is not None:
+                setattr(center, name, value)
+        if request.name is not None:
+            center.name = request.name.strip()
+        if request.phone is not None:
+            center.phone = request.phone.strip() or None
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="A centre with this name already exists.") from error
+        return public_center(center)
+
+    @application.put("/api/authority/me/center")
+    async def set_my_center(
+        request: MyCenterRequest,
+        user: User = Depends(require_roles("authority")),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """The centre this officer responds from; crash alarms reach officers of the nearest centres only."""
+        if request.center_id is not None:
+            center = db.get(AuthorityCenter, request.center_id)
+            if center is None or not center.active:
+                raise HTTPException(status_code=404, detail="Centre not found.")
+        user.center_id = request.center_id
+        db.commit()
+        return public_user(user)
 
     @application.get("/api/rfid/health")
     async def rfid_health(
@@ -1784,7 +2223,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             return
         await websocket.accept()
         async with application.state.socket_lock:
-            application.state.authority_sockets.add(websocket)
+            application.state.authority_sockets[websocket] = user.id
         try:
             while True:
                 await websocket.receive_text()
@@ -1792,7 +2231,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             pass
         finally:
             async with application.state.socket_lock:
-                application.state.authority_sockets.discard(websocket)
+                application.state.authority_sockets.pop(websocket, None)
 
     @application.websocket("/ws/citizen/alerts")
     async def citizen_alerts(websocket: WebSocket) -> None:
@@ -1985,7 +2424,7 @@ def create_app(database_engine: Engine = engine) -> FastAPI:
             if existing is None:
                 raise
             incident = existing
-        await broadcast({"type": "crash_alert", **public_incident(incident)})
+        await raise_crash_alert(db, incident)
         await broadcast({"type": "incident_created", **public_incident(incident)})
         for plate in plates:
             vehicle = db.scalar(select(Vehicle).where(Vehicle.plate == plate))

@@ -210,6 +210,10 @@ export class ApiClient {
     });
   }
 
+  put<T>(path: string, body: unknown) {
+    return this.request<T>(path, { method: 'PUT', body: JSON.stringify(body) });
+  }
+
   patch<T>(path: string, body: unknown) {
     return this.request<T>(path, { method: 'PATCH', body: JSON.stringify(body) });
   }
@@ -356,6 +360,11 @@ export class ApiClient {
 
   get currentToken() {
     return this.token;
+  }
+
+  /** wss URL of the website backend's event stream. Authenticate with the first message, not the URL. */
+  eventsSocketUrl() {
+    return this.url('/ws/events').replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
   }
 
   async authenticatedSocket(path: string) {

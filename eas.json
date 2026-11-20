@@ -11,7 +11,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://krishnagumaste.taila639bc.ts.net"
+        "EXPO_PUBLIC_API_URL": "https://aghatsethu.duckdns.org"
       }
     },
     "production": {
@@ -20,7 +20,7 @@
         "buildType": "app-bundle"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://krishnagumaste.taila639bc.ts.net"
+        "EXPO_PUBLIC_API_URL": "https://aghatsethu.duckdns.org"
       }
     }
   },
